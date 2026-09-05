@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["crates/tarant"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/voilecx/tarant"
+authors = ["voilecx"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+# `pub(crate)` in a private module is exactly how this crate is laid out.
+redundant_pub_crate = "allow"
+# Its suggestions read worse than the `if let` they replace.
+option_if_let_else = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
