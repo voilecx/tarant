@@ -51,10 +51,11 @@
 //!
 //! # Compatibility
 //!
-//! Targets Tarantool 3.0 and later, where spaces and indexes are addressed by
-//! name and no schema fetch is needed. Against 2.10–2.11 everything works
-//! except name addressing; [`Client::server_info`] reports what the handshake
-//! negotiated.
+//! Requires Tarantool 3.0 or later for space operations: the client addresses
+//! spaces and indexes by name, which the protocol gained in 3.0, so there is
+//! no schema fetch and no id cache to go stale. Against 2.10–2.11, `call`,
+//! `eval`, transactions and watchers still work; [`Client::server_info`]
+//! reports what the handshake negotiated.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms)]

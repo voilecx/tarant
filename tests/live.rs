@@ -2,21 +2,21 @@
 //!
 //! These are the tests that prove the wire format is right: unit tests can
 //! only check that we encode what we *think* the protocol is. Point
-//! `TARANT_TEST_ADDR` at an instance whose user can create spaces —
-//! `deploy/dev/tarantool.yaml` brings one up — and they run; without it they
-//! skip, so `cargo test` stays green on a machine with no server.
+//! `TARANT_TEST_ADDR` at an instance whose user can create spaces — the
+//! `compose.yaml` at the repository root brings one up — and they run;
+//! without it they skip, so `cargo test` stays green on a machine with no
+//! server.
 //!
 //! ```sh
-//! kubectl apply -f deploy/dev/tarantool.yaml
-//! export TARANT_TEST_ADDR="tarantool://tarant:tarant@$(
-//!   kubectl -n tarant get svc tarantool -o jsonpath='{.spec.clusterIP}'):3301"
-//! cargo test --test live
+//! docker compose up --wait
+//! TARANT_TEST_ADDR=tarantool://tarant:tarant@127.0.0.1:3301 cargo test --test live
 //! ```
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tarant::{Client, ErrorCode, Isolation, Iter, TxOptions, Update, Value};
+use tokio::sync::RwLock;
 
 /// A row of the space each test creates for itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,31 +46,37 @@ where
         return;
     };
     let space = format!("tarant_test_{name}");
-    let _: Vec<tarant::Value> = client
-        .eval(
-            "local name = ...
-             if box.space[name] then box.space[name]:drop() end
-             local s = box.schema.space.create(name)
-             s:format({{name='id', type='unsigned'},
-                       {name='name', type='string'},
-                       {name='age', type='unsigned'}})
-             s:create_index('primary', {parts={'id'}})
-             s:create_index('age', {parts={'age'}, unique=false})
-             return {}",
-            (&space,),
-        )
-        .await
-        .expect("create the test space");
+    ddl(&client, CREATE, &space).await.expect("create the test space");
+    {
+        let _schema_quiet = SCHEMA.read().await;
+        body(client.clone(), space.clone()).await;
+    }
+    ddl(&client, DROP, &space).await.expect("drop the test space");
+}
 
-    body(client.clone(), space.clone()).await;
+const CREATE: &str = "local name = ...
+    if box.space[name] then box.space[name]:drop() end
+    local s = box.schema.space.create(name)
+    s:format({{name='id', type='unsigned'},
+              {name='name', type='string'},
+              {name='age', type='unsigned'}})
+    s:create_index('primary', {parts={'id'}})
+    s:create_index('age', {parts={'age'}, unique=false})
+    return {}";
 
-    let _: Vec<tarant::Value> = client
-        .eval(
-            "local name = ... if box.space[name] then box.space[name]:drop() end return {}",
-            (&space,),
-        )
-        .await
-        .expect("drop the test space");
+const DROP: &str = "local name = ... if box.space[name] then box.space[name]:drop() end return {}";
+
+/// Keeps schema changes apart from running tests.
+///
+/// Under MVCC, Tarantool 3.0 aborts every open transaction when the schema
+/// changes and rejects concurrent DDL with `TRANSACTION_CONFLICT`; later
+/// releases queue it. So DDL takes the write side and a test body the read
+/// side: bodies still run, and pipeline their requests, in parallel.
+static SCHEMA: RwLock<()> = RwLock::const_new(());
+
+async fn ddl(client: &Client, script: &str, space: &str) -> tarant::Result<()> {
+    let _schema_exclusive = SCHEMA.write().await;
+    client.eval::<Vec<Value>>(script, (space,)).await.map(drop)
 }
 
 #[tokio::test]

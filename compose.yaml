@@ -1,0 +1,22 @@
+# A Tarantool for the integration tests.
+#
+#   docker compose up --wait
+#   TARANT_TEST_ADDR=tarantool://tarant:tarant@127.0.0.1:3301 cargo test
+#
+# Set TARANTOOL_VERSION to test another release, e.g. TARANTOOL_VERSION=3.0.
+services:
+  tarantool:
+    image: tarantool/tarantool:${TARANTOOL_VERSION:-3.8}
+    ports:
+      - "3301:3301"
+    environment:
+      TT_IPROTO_LISTEN: '[{"uri":"0.0.0.0:3301"}]'
+      TT_CREDENTIALS_USERS: '{"tarant":{"password":"tarant","roles":["super"]}}'
+      # Interactive transactions need the MVCC transaction manager; without
+      # it any DML inside a transaction aborts it with TRANSACTION_YIELD.
+      TT_DATABASE_USE_MVCC_ENGINE: "true"
+    healthcheck:
+      test: ["CMD", "tarantool", "-e", "os.exit(require('net.box').connect('127.0.0.1:3301'):ping() and 0 or 1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 30

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -26,32 +27,20 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   test:
-    name: tests against Tarantool ${{ matrix.tarantool }}
+    name: Tarantool ${{ matrix.tarantool }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # 3.x is what the client targets; 2.11 proves the graceful
-        # degradation the README promises (everything but name addressing).
-        tarantool: ["3.8", "2.11"]
-    services:
-      tarantool:
-        image: tarantool/tarantool:${{ matrix.tarantool }}
-        ports: ["3301:3301"]
-        env:
-          TT_IPROTO_LISTEN: '[{"uri":"0.0.0.0:3301"}]'
-          TT_DATABASE_USE_MVCC_ENGINE: "true"
+        # The oldest release the client supports, and the newest.
+        tarantool: ["3.0", "3.8"]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Create the test user
-        run: |
-          docker exec "$(docker ps -q --filter ancestor=tarantool/tarantool:${{ matrix.tarantool }})" \
-            tarantoolctl connect 3301 <<'LUA' || true
-          box.schema.user.create('tarant', {password = 'tarant', if_not_exists = true})
-          box.schema.user.grant('tarant', 'super', nil, nil, {if_not_exists = true})
-          LUA
+      - run: docker compose up --wait
+        env:
+          TARANTOOL_VERSION: ${{ matrix.tarantool }}
       - run: cargo test --all-features
         env:
           TARANT_TEST_ADDR: tarantool://tarant:tarant@127.0.0.1:3301
