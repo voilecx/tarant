@@ -258,7 +258,9 @@ to go stale. Against 2.10–2.11, `call`, `eval`, transactions and watchers stil
 work; `Client::server_info()` reports what the handshake negotiated. CI runs
 the integration suite against 3.0 and 3.8.
 
-**Rust 1.85 and later** (edition 2024), on tokio 1.x.
+**Rust 1.85 and later** (edition 2024), on tokio 1.x. The `time` feature is
+the one exception: it needs Rust 1.88, which is what `time` 0.3.47 — the
+release that fixed RUSTSEC-2026-0009 — requires.
 
 ## Feature flags
 

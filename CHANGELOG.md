@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-09-05
+
+### Security
+
+- The `time` feature now requires `time` 0.3.47 or later, which fixes
+  RUSTSEC-2026-0009 (stack exhaustion on hostile input). That release needs
+  Rust 1.88, so enabling the feature does too; the crate itself stays at 1.85.
+
 ## [0.2.0] — 2026-09-05
 
 The release that finishes the protocol: everything a service talks to a
@@ -82,7 +90,8 @@ First release.
 - Automatic reconnection with backoff: the handshake is replayed and every
   watcher re-subscribed.
 
-[Unreleased]: https://github.com/voilecx/tarant/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/voilecx/tarant/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/voilecx/tarant/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/voilecx/tarant/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/voilecx/tarant/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/voilecx/tarant/releases/tag/v0.1.0

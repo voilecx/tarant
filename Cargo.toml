@@ -1,6 +1,6 @@
 [package]
 name = "tarant"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.85"
 description = "An async Tarantool client: native iproto, typed end to end, no unsafe"
@@ -36,7 +36,8 @@ rust_decimal = { version = "1", optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 sha1 = "0.10.7"
 thiserror = "2.0.20"
-time = { version = "0.3", optional = true }
+# 0.3.47 fixes RUSTSEC-2026-0009; it needs Rust 1.88, so this feature does too.
+time = { version = "0.3.47", optional = true }
 tokio = { version = "1.53.1", features = ["net", "rt", "sync", "time", "io-util", "macros"] }
 tokio-util = { version = "0.7.19", features = ["codec"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
