@@ -4,11 +4,11 @@ An async Rust client for [Tarantool](https://www.tarantool.io), built on
 [tokio](https://tokio.rs). It speaks the binary protocol natively, is typed
 end to end, and stays out of your way.
 
-[![crates.io](https://img.shields.io/crates/v/tarant.svg)](https://crates.io/crates/tarant)
+[![crates.io](https://img.shields.io/crates/v/tarant?logo=rust&logoColor=white)](https://crates.io/crates/tarant)
 [![docs.rs](https://img.shields.io/docsrs/tarant)](https://docs.rs/tarant)
 [![CI](https://github.com/voilecx/tarant/actions/workflows/ci.yml/badge.svg)](https://github.com/voilecx/tarant/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/crates/msrv/tarant)](#compatibility)
-[![license](https://img.shields.io/crates/l/tarant.svg)](#license)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
 ```toml
 [dependencies]
