@@ -1,14 +1,15 @@
 //! Wire-level vocabulary of the iproto protocol.
 //!
-//! Everything here mirrors `src/box/iproto_constants.h` in the Tarantool
-//! sources. The numbers are the protocol; the names are ours. Nothing in this
-//! module allocates or does I/O — it is the dictionary the codec speaks.
+//! Everything here mirrors `iproto_constants.h`, `iproto_features.h` and
+//! `mp_extension_types.h` in the Tarantool sources. The numbers are the
+//! protocol; the names are ours. Nothing in this module allocates or does
+//! I/O — it is the dictionary the codec speaks.
 
 /// Keys of the request/response header and body maps.
 ///
-/// The full set is listed even where this client has no use for a key yet:
-/// the module is the protocol's vocabulary, and a missing constant is how a
-/// future request type gets encoded wrong.
+/// The full client-facing set is listed even where this client has no use
+/// for a key yet: the module is the protocol's vocabulary, and a missing
+/// constant is how a future request type gets encoded wrong.
 #[allow(dead_code)]
 pub(crate) mod key {
     pub const REQUEST_TYPE: u8 = 0x00;
@@ -28,11 +29,25 @@ pub(crate) mod key {
     pub const USER_NAME: u8 = 0x23;
     pub const EXPR: u8 = 0x27;
     pub const OPS: u8 = 0x28;
+    /// SQL: statement options. A map, in practice always empty.
+    pub const OPTIONS: u8 = 0x2b;
     pub const AFTER_POSITION: u8 = 0x2e;
     pub const AFTER_TUPLE: u8 = 0x2f;
     pub const DATA: u8 = 0x30;
     pub const ERROR_24: u8 = 0x31;
+    /// SQL: column descriptions of a result set.
+    pub const METADATA: u8 = 0x32;
+    /// SQL: parameter descriptions of a prepared statement.
+    pub const BIND_METADATA: u8 = 0x33;
+    /// SQL: number of parameters a prepared statement takes.
+    pub const BIND_COUNT: u8 = 0x34;
     pub const POSITION: u8 = 0x35;
+    /// An Arrow IPC stream (`MP_ARROW`) for `IPROTO_INSERT_ARROW`.
+    pub const ARROW: u8 = 0x36;
+    pub const SQL_TEXT: u8 = 0x40;
+    pub const SQL_BIND: u8 = 0x41;
+    pub const SQL_INFO: u8 = 0x42;
+    pub const STMT_ID: u8 = 0x43;
     pub const ERROR: u8 = 0x52;
     pub const VERSION: u8 = 0x54;
     pub const FEATURES: u8 = 0x55;
@@ -45,6 +60,22 @@ pub(crate) mod key {
     pub const SPACE_NAME: u8 = 0x5e;
     /// Since Tarantool 3.0: address an index by name.
     pub const INDEX_NAME: u8 = 0x5f;
+    /// Since Tarantool 3.1: the formats of `MP_TUPLE`s in a response.
+    pub const TUPLE_FORMATS: u8 = 0x60;
+    /// Since Tarantool 3.3: make a transaction synchronous.
+    pub const IS_SYNC: u8 = 0x61;
+}
+
+/// Keys nested inside `IPROTO_METADATA` entries and `IPROTO_SQL_INFO`.
+pub(crate) mod sql {
+    pub const FIELD_NAME: u8 = 0x00;
+    pub const FIELD_TYPE: u8 = 0x01;
+    pub const FIELD_COLL: u8 = 0x02;
+    pub const FIELD_IS_NULLABLE: u8 = 0x03;
+    pub const FIELD_IS_AUTOINCREMENT: u8 = 0x04;
+    pub const FIELD_SPAN: u8 = 0x05;
+    pub const INFO_ROW_COUNT: u8 = 0x00;
+    pub const INFO_AUTOINCREMENT_IDS: u8 = 0x01;
 }
 
 /// Request types (the value under [`key::REQUEST_TYPE`] in a request header).
@@ -58,9 +89,12 @@ pub(crate) mod request {
     pub const EVAL: u64 = 0x08;
     pub const UPSERT: u64 = 0x09;
     pub const CALL: u64 = 0x0a;
+    pub const EXECUTE: u64 = 0x0b;
+    pub const PREPARE: u64 = 0x0d;
     pub const BEGIN: u64 = 0x0e;
     pub const COMMIT: u64 = 0x0f;
     pub const ROLLBACK: u64 = 0x10;
+    pub const INSERT_ARROW: u64 = 0x11;
     pub const PING: u64 = 0x40;
     pub const ID: u64 = 0x49;
     pub const WATCH: u64 = 0x4a;
@@ -92,27 +126,31 @@ pub(crate) mod error {
 }
 
 /// `MessagePack` extension type tags Tarantool defines.
-///
-/// Only [`ERROR`](ext::ERROR) is decoded today; the rest are here so the
-/// numbers live in one place when `DECIMAL`, `UUID` and `DATETIME` gain
-/// first-class support.
 #[allow(dead_code)]
 pub(crate) mod ext {
     pub const DECIMAL: i8 = 1;
     pub const UUID: i8 = 2;
     pub const ERROR: i8 = 3;
     pub const DATETIME: i8 = 4;
+    /// Enterprise Edition only.
+    pub const COMPRESSION: i8 = 5;
     pub const INTERVAL: i8 = 6;
+    /// A tuple with its format id; sent only to clients that ask for it.
+    pub const TUPLE: i8 = 7;
+    pub const ARROW: i8 = 8;
 }
 
 /// The protocol version this client speaks; sent in `IPROTO_ID`.
-pub(crate) const PROTOCOL_VERSION: u64 = 6;
+pub(crate) const PROTOCOL_VERSION: u64 = 10;
 
-/// Protocol features negotiated with `IPROTO_ID`.
+/// Protocol features, as listed in `iproto_features.h`.
 ///
-/// The client announces the features it implements; the server answers with
-/// the intersection it supports. Anything not in the answer is off for the
-/// life of the connection.
+/// The handshake works in both directions: the client announces the
+/// features it implements ([`Feature::ANNOUNCED`]), and the server replies
+/// with everything *it* implements. [`ServerInfo::supports`] reports the
+/// server's side, so it can be true for a feature this client does not use.
+///
+/// [`ServerInfo::supports`]: crate::ServerInfo::supports
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Feature {
@@ -124,36 +162,83 @@ pub enum Feature {
     ErrorExtension,
     /// `IPROTO_WATCH` / `UNWATCH` / `EVENT`: server-pushed notifications.
     Watchers,
-    /// `IPROTO_WATCH_ONCE`: read a broadcast key without subscribing.
-    WatchOnce,
+    /// Cursor pagination: `AFTER_POSITION`, `AFTER_TUPLE`, `FETCH_POSITION`.
+    Pagination,
     /// Spaces and indexes may be addressed by name instead of id.
     SpaceAndIndexNames,
+    /// `IPROTO_WATCH_ONCE`: read a broadcast key without subscribing.
+    WatchOnce,
+    /// DML responses may carry tuples as `MP_TUPLE` with their formats.
+    ///
+    /// Not announced by this client: a format id only means something to a
+    /// `box.tuple` object, and a typed client decodes rows into your types.
+    DmlTupleExtension,
+    /// `call`/`eval` results may carry `MP_TUPLE`s. Not announced; see
+    /// [`DmlTupleExtension`](Self::DmlTupleExtension).
+    CallRetTupleExtension,
+    /// `call`/`eval` arguments may carry `MP_TUPLE`s. Not announced; see
+    /// [`DmlTupleExtension`](Self::DmlTupleExtension).
+    CallArgTupleExtension,
+    /// `FETCH_SNAPSHOT` with a cursor. Replication only; not announced.
+    FetchSnapshotCursor,
+    /// `IPROTO_IS_SYNC` on `BEGIN`/`COMMIT`: synchronous transactions.
+    IsSync,
+    /// `IPROTO_INSERT_ARROW`: batch insertion of an Arrow IPC stream.
+    InsertArrow,
 }
 
 impl Feature {
-    /// Every feature this client implements, in announcement order.
-    pub(crate) const SUPPORTED: [Self; 6] = [
+    /// What this client announces in `IPROTO_ID`: every feature it implements.
+    pub const ANNOUNCED: [Self; 9] = [
         Self::Streams,
         Self::Transactions,
         Self::ErrorExtension,
         Self::Watchers,
-        Self::WatchOnce,
+        Self::Pagination,
         Self::SpaceAndIndexNames,
+        Self::WatchOnce,
+        Self::IsSync,
+        Self::InsertArrow,
     ];
 
-    pub(crate) const fn code(self) -> u64 {
+    const ALL: [Self; 13] = [
+        Self::Streams,
+        Self::Transactions,
+        Self::ErrorExtension,
+        Self::Watchers,
+        Self::Pagination,
+        Self::SpaceAndIndexNames,
+        Self::WatchOnce,
+        Self::DmlTupleExtension,
+        Self::CallRetTupleExtension,
+        Self::CallArgTupleExtension,
+        Self::FetchSnapshotCursor,
+        Self::IsSync,
+        Self::InsertArrow,
+    ];
+
+    /// The feature's number on the wire.
+    pub const fn code(self) -> u64 {
         match self {
             Self::Streams => 0,
             Self::Transactions => 1,
             Self::ErrorExtension => 2,
             Self::Watchers => 3,
-            Self::WatchOnce => 4,
+            Self::Pagination => 4,
             Self::SpaceAndIndexNames => 5,
+            Self::WatchOnce => 6,
+            Self::DmlTupleExtension => 7,
+            Self::CallRetTupleExtension => 8,
+            Self::CallArgTupleExtension => 9,
+            Self::FetchSnapshotCursor => 10,
+            Self::IsSync => 11,
+            Self::InsertArrow => 12,
         }
     }
 
-    pub(crate) fn from_code(code: u64) -> Option<Self> {
-        Self::SUPPORTED.into_iter().find(|feature| feature.code() == code)
+    /// The feature with this number, if the client knows it.
+    pub fn from_code(code: u64) -> Option<Self> {
+        Self::ALL.into_iter().find(|feature| feature.code() == code)
     }
 }
 

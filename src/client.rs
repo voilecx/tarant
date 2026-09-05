@@ -12,11 +12,12 @@ use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::codec::Request;
-use crate::connection::{Handle, Negotiated};
+use crate::codec::{Request, to_msgpack_array};
+use crate::connection::{Handle, Negotiated, PushStream};
 use crate::error::{Error, Result};
-use crate::iproto::{Feature, Isolation, Iter, key, request};
+use crate::iproto::{Feature, Isolation, Iter, ext, key, request};
 use crate::options::ConnectOptions;
+use crate::sql::{self, Exec, Rows, Statement};
 use crate::tuple::{Args, Key, encode_array};
 use crate::update::Update;
 use crate::watcher::Watcher;
@@ -88,7 +89,7 @@ impl Client {
         let sync = self.handle.next_sync();
         let packet = Request::new(request::CALL, sync, None)
             .str(key::FUNCTION_NAME, name)
-            .raw(key::TUPLE, &encode_array(&args)?)
+            .array(key::TUPLE, &args)?
             .finish();
         self.handle.request(sync, packet).await?.data()
     }
@@ -102,9 +103,107 @@ impl Client {
         let sync = self.handle.next_sync();
         let packet = Request::new(request::EVAL, sync, None)
             .str(key::EXPR, expr)
-            .raw(key::TUPLE, &encode_array(&args)?)
+            .array(key::TUPLE, &args)?
             .finish();
         self.handle.request(sync, packet).await?.data()
+    }
+
+    /// Call a stored function that streams results with `box.session.push()`.
+    ///
+    /// Each pushed value arrives through [`PushCall::next_push`] as the
+    /// function runs; [`PushCall::finish`] then yields its return value as
+    /// `R`. Deprecated on the server since 3.0 — new code should prefer
+    /// [`watch`](Self::watch) — but still supported.
+    ///
+    /// ```no_run
+    /// # use tarant::Client;
+    /// # async fn demo(client: Client) -> tarant::Result<()> {
+    /// let mut job = client.call_with_pushes::<(u64,)>("reindex", ("users",)).await?;
+    /// while let Some(progress) = job.next_push::<u8>().await? {
+    ///     println!("{progress}%");
+    /// }
+    /// let (rows,) = job.finish().await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn call_with_pushes<R: DeserializeOwned>(
+        &self,
+        name: &str,
+        args: impl Args,
+    ) -> Result<PushCall<R>> {
+        let sync = self.handle.next_sync();
+        let packet = Request::new(request::CALL, sync, None)
+            .str(key::FUNCTION_NAME, name)
+            .array(key::TUPLE, &args)?
+            .finish();
+        PushCall::start(&self.handle, sync, packet).await
+    }
+
+    /// [`eval`](Self::eval) for an expression that uses `box.session.push()`.
+    pub async fn eval_with_pushes<R: DeserializeOwned>(
+        &self,
+        expr: &str,
+        args: impl Args,
+    ) -> Result<PushCall<R>> {
+        let sync = self.handle.next_sync();
+        let packet = Request::new(request::EVAL, sync, None)
+            .str(key::EXPR, expr)
+            .array(key::TUPLE, &args)?
+            .finish();
+        PushCall::start(&self.handle, sync, packet).await
+    }
+
+    /// Run an SQL statement that returns rows, decoding each as `T`.
+    ///
+    /// `params` fill the statement's placeholders: a plain value takes the
+    /// next `?`, a [`Named`](sql::Named) takes its `:name`. Use
+    /// [`execute`](Self::execute) for statements that change data.
+    ///
+    /// ```no_run
+    /// # use tarant::Client;
+    /// # async fn demo(client: Client) -> tarant::Result<()> {
+    /// let adults = client
+    ///     .query::<(u64, String)>("SELECT id, name FROM users WHERE age >= ?", 18)
+    ///     .await?;
+    /// for (id, name) in &adults.rows {
+    ///     println!("{id}: {name}");
+    /// }
+    /// assert_eq!(adults.columns[1].name, "NAME");
+    /// # Ok(()) }
+    /// ```
+    pub async fn query<T: DeserializeOwned>(
+        &self,
+        sql: &str,
+        params: impl Args,
+    ) -> Result<Rows<T>> {
+        sql::rows(&sql::run_text(&self.handle, None, sql, params).await?)
+    }
+
+    /// Run an SQL statement for its effect, reporting the rows it changed.
+    ///
+    /// ```no_run
+    /// # use tarant::Client;
+    /// # async fn demo(client: Client) -> tarant::Result<()> {
+    /// let done = client.execute("DELETE FROM sessions WHERE expires < ?", 1_700_000_000u64).await?;
+    /// println!("expired {} sessions", done.row_count);
+    /// # Ok(()) }
+    /// ```
+    pub async fn execute(&self, sql: &str, params: impl Args) -> Result<Exec> {
+        sql::exec(&sql::run_text(&self.handle, None, sql, params).await?)
+    }
+
+    /// Parse an SQL statement once, to run it many times with different parameters.
+    ///
+    /// ```no_run
+    /// # use tarant::Client;
+    /// # async fn demo(client: Client) -> tarant::Result<()> {
+    /// let insert = client.prepare("INSERT INTO events (kind, payload) VALUES (?, ?)").await?;
+    /// for kind in ["start", "stop"] {
+    ///     insert.execute((kind, "{}")).await?;
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
+        Statement::prepare(self.handle.clone(), sql.to_owned()).await
     }
 
     /// Round-trip a `ping`. Cheap; useful as a liveness probe.
@@ -204,6 +303,47 @@ impl ServerInfo<'_> {
     }
 }
 
+/// A running call whose function pushes values before it returns.
+///
+/// Made by [`Client::call_with_pushes`] and [`Client::eval_with_pushes`].
+/// Read the pushes with [`next_push`](Self::next_push) until it yields
+/// `None`, then take the return value with [`finish`](Self::finish).
+/// Finishing early drops the pushes not yet read.
+#[must_use = "a PushCall does nothing until its pushes are read or it is finished"]
+pub struct PushCall<R> {
+    stream: PushStream,
+    _return: std::marker::PhantomData<fn() -> R>,
+}
+
+impl<R: DeserializeOwned> PushCall<R> {
+    async fn start(handle: &Handle, sync: u64, packet: Bytes) -> Result<Self> {
+        let stream = handle.request_with_pushes(sync, packet).await?;
+        Ok(Self { stream, _return: std::marker::PhantomData })
+    }
+
+    /// The next pushed value decoded as `P`, or `None` once the function has returned.
+    pub async fn next_push<P: DeserializeOwned>(&mut self) -> Result<Option<P>> {
+        match self.stream.pushes.recv().await {
+            Some(bytes) => {
+                let (value,): (P,) = rmp_serde::from_slice(&bytes).map_err(Error::decode)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Wait for the function to return, decoding its result as `R`.
+    pub async fn finish(self) -> Result<R> {
+        self.stream.finish().await?.data()
+    }
+}
+
+impl<R> std::fmt::Debug for PushCall<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushCall").finish_non_exhaustive()
+    }
+}
+
 /// Typed CRUD over one space, addressed by name.
 ///
 /// `T` is the tuple type. It is used as the argument to writes and the
@@ -267,6 +407,24 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Space<T> {
         self.handle.request(sync, packet).await.map(drop)
     }
 
+    /// Insert every row of an Arrow IPC stream in one request (Tarantool 3.3+).
+    ///
+    /// `ipc` is the stream as the `arrow` crate's IPC writer produces it: a
+    /// schema followed by record batches whose columns match the space
+    /// format by name. Rows are inserted as one batch; a duplicate key
+    /// rejects the whole request.
+    pub async fn insert_arrow(&self, ipc: &[u8]) -> Result<()> {
+        if !self.handle.supports(Feature::InsertArrow) {
+            return Err(Error::Unsupported("Arrow insert (server is older than 3.3)"));
+        }
+        let sync = self.handle.next_sync();
+        let packet = Request::new(request::INSERT_ARROW, sync, None)
+            .str(key::SPACE_NAME, &self.name)
+            .ext(key::ARROW, ext::ARROW, ipc)?
+            .finish();
+        self.handle.request(sync, packet).await.map(drop)
+    }
+
     /// Fetch the tuple whose primary key equals `key`, if any.
     ///
     /// `key` follows the [`Key`] rules: a scalar for a one-field primary key,
@@ -282,7 +440,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Space<T> {
         let packet = Request::new(request::DELETE, sync, None)
             .str(key::SPACE_NAME, &self.name)
             .uint(key::INDEX_ID, 0)
-            .raw(key::KEY, &encode_array(&key)?)
+            .array(key::KEY, &key)?
             .finish();
         let rows: Vec<T> = self.handle.request(sync, packet).await?.data()?;
         Ok(rows.into_iter().next())
@@ -297,7 +455,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Space<T> {
             .str(key::SPACE_NAME, &self.name)
             .uint(key::INDEX_ID, 0)
             .uint(key::INDEX_BASE, 1)
-            .raw(key::KEY, &encode_array(&key)?)
+            .array(key::KEY, &key)?
             .raw_array(key::TUPLE, &ops.into_ops()?)
             .finish();
         let rows: Vec<T> = self.handle.request(sync, packet).await?.data()?;
@@ -385,7 +543,7 @@ pub struct Select<T> {
     iter: Iter,
     limit: Option<u64>,
     offset: u64,
-    after: Option<String>,
+    after: Option<After>,
     fetch_position: bool,
     _tuple: std::marker::PhantomData<fn() -> T>,
 }
@@ -432,7 +590,17 @@ impl<T> Select<T> {
     /// go missing. Prefer it over [`offset`](Self::offset) for anything that
     /// walks a whole space.
     pub fn after(mut self, position: impl Into<String>) -> Self {
-        self.after = Some(position.into());
+        self.after = Some(After::Position(position.into()));
+        self
+    }
+
+    /// Resume after `tuple`, a whole tuple of the space rather than a cursor.
+    ///
+    /// The same guarantee as [`after`](Self::after), for the case where the
+    /// caller kept the last row rather than the position token. The two are
+    /// exclusive; the last one set wins.
+    pub fn after_tuple<U: Serialize + ?Sized>(mut self, tuple: &U) -> Self {
+        self.after = Some(After::Tuple(to_msgpack_array(tuple)));
         self
     }
 
@@ -479,14 +647,23 @@ impl<T> Select<T> {
         }
         req = req.uint(key::LIMIT, self.limit.unwrap_or_else(|| u64::from(u32::MAX)));
         req = req.raw(key::KEY, &key);
-        if let Some(after) = &self.after {
-            req = req.str(key::AFTER_POSITION, after);
+        match self.after {
+            Some(After::Position(position)) => req = req.str(key::AFTER_POSITION, &position),
+            Some(After::Tuple(tuple)) => req = req.raw(key::AFTER_TUPLE, &tuple?),
+            None => {}
         }
         if self.fetch_position {
             req = req.bool(key::FETCH_POSITION, true);
         }
         Ok((self.handle, sync, req.finish()))
     }
+}
+
+/// Where a paginated select resumes from.
+#[derive(Debug)]
+enum After {
+    Position(String),
+    Tuple(Result<Vec<u8>>),
 }
 
 /// One page of a [`Select::page`] walk: the rows, and where to resume.
@@ -552,6 +729,7 @@ impl<T> std::fmt::Debug for Select<T> {
 pub struct TxOptions {
     isolation: Isolation,
     timeout: Option<std::time::Duration>,
+    synchronous: bool,
 }
 
 impl TxOptions {
@@ -572,6 +750,16 @@ impl TxOptions {
     /// locks forever even if the client disappears.
     pub const fn timeout(mut self, timeout: std::time::Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    /// Commit only once a quorum of replicas has confirmed the transaction
+    /// (Tarantool 3.3+), whether or not the spaces it touches are synchronous.
+    ///
+    /// With no synchronous replication configured the quorum is the instance
+    /// itself, so this is safe to set unconditionally.
+    pub const fn synchronous(mut self) -> Self {
+        self.synchronous = true;
         self
     }
 }
@@ -623,6 +811,9 @@ impl Stream {
             return Err(Error::Unsupported("transactions (server is older than 2.10)"));
         }
         let options = options.into();
+        if options.synchronous && !self.handle.supports(Feature::IsSync) {
+            return Err(Error::Unsupported("synchronous transactions (server is older than 3.3)"));
+        }
         let sync = self.handle.next_sync();
         let mut req = Request::new(request::BEGIN, sync, Some(self.id));
         if !matches!(options.isolation, Isolation::Default) {
@@ -630,6 +821,9 @@ impl Stream {
         }
         if let Some(timeout) = options.timeout {
             req = req.f64(key::TIMEOUT, timeout.as_secs_f64());
+        }
+        if options.synchronous {
+            req = req.bool(key::IS_SYNC, true);
         }
         self.handle.request(sync, req.finish()).await?;
         self.in_transaction = true;
@@ -659,7 +853,7 @@ impl Stream {
         let sync = self.handle.next_sync();
         let packet = Request::new(request::CALL, sync, Some(self.id))
             .str(key::FUNCTION_NAME, name)
-            .raw(key::TUPLE, &encode_array(&args)?)
+            .array(key::TUPLE, &args)?
             .finish();
         self.handle.request(sync, packet).await?.data()
     }
@@ -673,9 +867,37 @@ impl Stream {
         let sync = self.handle.next_sync();
         let packet = Request::new(request::EVAL, sync, Some(self.id))
             .str(key::EXPR, expr)
-            .raw(key::TUPLE, &encode_array(&args)?)
+            .array(key::TUPLE, &args)?
             .finish();
         self.handle.request(sync, packet).await?.data()
+    }
+
+    /// [`Client::query`] within this stream's ordering and transaction.
+    pub async fn query<T: DeserializeOwned>(
+        &self,
+        sql: &str,
+        params: impl Args,
+    ) -> Result<Rows<T>> {
+        sql::rows(&sql::run_text(&self.handle, Some(self.id), sql, params).await?)
+    }
+
+    /// [`Client::execute`] within this stream's ordering and transaction.
+    pub async fn execute(&self, sql: &str, params: impl Args) -> Result<Exec> {
+        sql::exec(&sql::run_text(&self.handle, Some(self.id), sql, params).await?)
+    }
+
+    /// Run a prepared statement for its rows, within this stream.
+    pub async fn query_prepared<T: DeserializeOwned>(
+        &self,
+        statement: &Statement,
+        params: impl Args,
+    ) -> Result<Rows<T>> {
+        sql::rows(&statement.run(Some(self.id), params).await?)
+    }
+
+    /// Run a prepared statement for its effect, within this stream.
+    pub async fn execute_prepared(&self, statement: &Statement, params: impl Args) -> Result<Exec> {
+        sql::exec(&statement.run(Some(self.id), params).await?)
     }
 }
 

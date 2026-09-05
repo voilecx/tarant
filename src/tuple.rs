@@ -12,6 +12,7 @@ use serde::Serialize;
 
 use crate::codec::to_msgpack;
 use crate::error::Result;
+use crate::types::{Datetime, Decimal, Interval, Uuid};
 
 mod sealed {
     pub trait ArrayLike {
@@ -41,7 +42,13 @@ pub trait Key: ArrayLike {}
 /// Arguments of a stored-procedure call or a Lua `eval`.
 ///
 /// Same shapes as [`Key`]: `()` for no arguments, a tuple for several, a
-/// scalar for one.
+/// scalar for one. A Lua table argument is a map: a `struct`, a
+/// `BTreeMap`, or [`Value::Map`].
+///
+/// An explicit `nil` is not an absent argument. `Value::Nil` arrives as
+/// `box.NULL`, which Lua treats as a *present, truthy* value, so code like
+/// `opts or {}` does not take the default. To leave an optional trailing
+/// argument out, send a shorter tuple.
 pub trait Args: ArrayLike {}
 
 impl<T: ArrayLike + ?Sized> Key for T {}
@@ -67,9 +74,15 @@ macro_rules! scalar_keys {
 }
 
 scalar_keys!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, bool, str, String);
+scalar_keys!(Decimal, Datetime, Interval, Uuid);
 
 #[cfg(feature = "uuid")]
-scalar_keys!(uuid::Uuid);
+impl ArrayLike for ::uuid::Uuid {
+    /// Sent as `MP_UUID`, which is what a `uuid`-typed index part expects.
+    fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
+        Uuid::from(*self).encode(buf)
+    }
+}
 
 impl<T: ArrayLike + ?Sized> ArrayLike for &T {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {

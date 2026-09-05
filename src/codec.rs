@@ -12,7 +12,6 @@
 //!   typed decode can happen later, exactly once, straight from the buffer.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rmpv::Value;
@@ -23,6 +22,7 @@ use tokio_util::codec::{Decoder, Encoder};
 use crate::error::{Error, ErrorCode, Result, ServerError};
 use crate::iproto::{error as error_key, key, response};
 use crate::msgpack::{MapCursor, read_str, read_uint};
+use crate::tuple::ArrayLike;
 
 /// Largest packet we are willing to buffer, matching the server's own limit.
 const MAX_PACKET_LEN: usize = 2 * 1024 * 1024 * 1024;
@@ -161,6 +161,24 @@ impl Request {
         Ok(self)
     }
 
+    /// Write `payload` as the `MessagePack` extension `tag`.
+    pub(crate) fn ext(mut self, k: u8, tag: i8, payload: &[u8]) -> Result<Self> {
+        self.key(k);
+        let len = u32::try_from(payload.len())
+            .map_err(|_| Error::protocol("extension payload exceeds 4 GiB"))?;
+        rmp::encode::write_ext_meta(&mut self.body, len, tag).expect("vec write");
+        self.body.extend_from_slice(payload);
+        Ok(self)
+    }
+
+    /// Write a tuple-, key- or argument-shaped value straight into the body,
+    /// with no intermediate buffer.
+    pub(crate) fn array<T: ArrayLike + ?Sized>(mut self, k: u8, value: &T) -> Result<Self> {
+        self.key(k);
+        value.encode(&mut self.body)?;
+        Ok(self)
+    }
+
     /// Write an already-encoded `MessagePack` value verbatim.
     pub(crate) fn raw(mut self, k: u8, msgpack: &[u8]) -> Self {
         self.key(k);
@@ -232,9 +250,16 @@ pub(crate) struct Response {
     body: Bytes,
     data: Option<(usize, usize)>,
     position: Option<String>,
-    error: Option<ServerError>,
+    // Boxed so an OK response — the common case — does not carry a 150-byte
+    // `ServerError` inline; only the error path pays for the allocation.
+    error: Option<Box<ServerError>>,
     event_key: Option<String>,
     event_data: Option<(usize, usize)>,
+    metadata: Option<(usize, usize)>,
+    bind_metadata: Option<(usize, usize)>,
+    sql_info: Option<(usize, usize)>,
+    bind_count: Option<u64>,
+    stmt_id: Option<u64>,
 }
 
 impl Response {
@@ -272,6 +297,11 @@ impl Response {
             error: None,
             event_key: None,
             event_data: None,
+            metadata: None,
+            bind_metadata: None,
+            sql_info: None,
+            bind_count: None,
+            stmt_id: None,
         };
 
         if this.body.is_empty() {
@@ -289,16 +319,21 @@ impl Response {
                 key::ERROR => error_ext = Some(v.to_vec()),
                 key::EVENT_KEY => this.event_key = Some(read_str(v)?.to_owned()),
                 key::EVENT_DATA => this.event_data = Some(range),
+                key::METADATA => this.metadata = Some(range),
+                key::BIND_METADATA => this.bind_metadata = Some(range),
+                key::SQL_INFO => this.sql_info = Some(range),
+                key::BIND_COUNT => this.bind_count = Some(read_uint(v)?),
+                key::STMT_ID => this.stmt_id = Some(read_uint(v)?),
                 _ => {}
             }
         }
 
         if kind == Kind::Error {
             let code = u32::try_from(request_type & !response::ERROR_FLAG).unwrap_or(0);
-            this.error = Some(match error_ext {
+            this.error = Some(Box::new(match error_ext {
                 Some(bytes) => decode_error_map(&bytes, code)?,
                 None => ServerError::from_message(code, error_24.unwrap_or_default()),
-            });
+            }));
         }
         Ok(this)
     }
@@ -327,10 +362,42 @@ impl Response {
 
     /// The `IPROTO_DATA` payload as raw `MessagePack` (`nil` if absent).
     pub(crate) fn data_bytes(&self) -> &[u8] {
-        match self.data {
-            Some((start, end)) => &self.body[start..end],
-            None => &[0xc0],
-        }
+        self.slice(self.data).unwrap_or(&[0xc0])
+    }
+
+    /// Whether the body carries `IPROTO_DATA` at all.
+    pub(crate) const fn has_data(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// SQL: the `IPROTO_METADATA` array describing result columns.
+    pub(crate) fn metadata_bytes(&self) -> Option<&[u8]> {
+        self.slice(self.metadata)
+    }
+
+    /// SQL: the `IPROTO_BIND_METADATA` array describing parameters.
+    pub(crate) fn bind_metadata_bytes(&self) -> Option<&[u8]> {
+        self.slice(self.bind_metadata)
+    }
+
+    /// SQL: the `IPROTO_SQL_INFO` map of a data-changing statement.
+    pub(crate) fn sql_info_bytes(&self) -> Option<&[u8]> {
+        self.slice(self.sql_info)
+    }
+
+    /// SQL: how many parameters a prepared statement takes.
+    pub(crate) const fn bind_count(&self) -> Option<u64> {
+        self.bind_count
+    }
+
+    /// SQL: the id of a freshly prepared statement.
+    pub(crate) const fn stmt_id(&self) -> Option<u64> {
+        self.stmt_id
+    }
+
+    fn slice(&self, range: Option<(usize, usize)>) -> Option<&[u8]> {
+        let (start, end) = range?;
+        Some(&self.body[start..end])
     }
 
     /// The pagination position returned when `fetch_position` was set.
@@ -341,16 +408,12 @@ impl Response {
     /// The watched key and its data for an event packet.
     pub(crate) fn event(&self) -> Option<(&str, &[u8])> {
         let key = self.event_key.as_deref()?;
-        let data = match self.event_data {
-            Some((start, end)) => &self.body[start..end],
-            None => &[0xc0][..],
-        };
-        Some((key, data))
+        Some((key, self.slice(self.event_data).unwrap_or(&[0xc0])))
     }
 
     /// Turn an error packet into its [`ServerError`].
     pub(crate) fn into_error(self) -> ServerError {
-        self.error.unwrap_or_else(|| ServerError::from_message(0, "unknown server error"))
+        self.error.map_or_else(|| ServerError::from_message(0, "unknown server error"), |err| *err)
     }
 }
 
@@ -418,19 +481,10 @@ pub(crate) fn to_msgpack<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// A tiny `Write` adapter so `rmp` can append into a `BytesMut`.
-#[allow(dead_code)]
-pub(crate) struct BytesWriter<'a>(pub(crate) &'a mut BytesMut);
-
-impl Write for BytesWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+/// Like [`to_msgpack`], but the value must be tuple-shaped (an `MP_ARRAY`).
+pub(crate) fn to_msgpack_array<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    let buf = to_msgpack(value)?;
+    if is_array_marker(buf.first().copied()) { Ok(buf) } else { Err(Error::encode(NotAnArray)) }
 }
 
 #[cfg(test)]

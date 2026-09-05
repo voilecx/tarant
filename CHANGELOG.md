@@ -6,6 +6,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-09-05
+
+The release that finishes the protocol: everything a service talks to a
+Tarantool 3.x instance for is now typed and tested against a live server.
+
+### Added
+
+- **SQL.** `Client::query`, `Client::execute`, and `Client::prepare` for
+  prepared statements, each with a twin on `Stream` for use in a transaction.
+  Parameters are an argument list in which a plain value fills a `?` and
+  `sql::Named` fills a `:name`. Result columns arrive as `sql::Column`.
+- **Field types.** `Decimal`, `Uuid`, `Datetime` and `Interval` encode as the
+  MessagePack extensions Tarantool expects, usable in tuple structs, as keys,
+  and via `TryFrom<&Value>`. Optional conversions behind the `uuid`,
+  `rust_decimal`, `time`, `chrono` and `jiff` features.
+- **Synchronous transactions.** `TxOptions::synchronous()` (Tarantool 3.3+).
+- **Arrow insert.** `Space::insert_arrow` for `IPROTO_INSERT_ARROW` (3.3+).
+- **Session push.** `Client::call_with_pushes` / `eval_with_pushes` return a
+  `PushCall` that yields `box.session.push` values as they arrive.
+- **Tuple-cursor pagination.** `Select::after_tuple`, alongside `after`.
+- More `ErrorCode` constants (SQL, sync, field-type, unsupported).
+- A live test of the full `tarantool/queue` lifecycle, and a README section
+  on driving the queue, including the reconnect caveat.
+
+### Removed
+
+- Six transitive dependencies: `base64` (the greeting salt is decoded
+  in-crate), `futures-util` (the socket is driven through `Framed`'s own
+  `Sink`/`Stream`), and what they pulled in. `Response` is a third smaller
+  and request encoding no longer allocates a scratch buffer per tuple.
+
+### Changed
+
+- The client now announces protocol version 10 and the `pagination`,
+  `is_sync` and `insert_arrow` features. `Feature` gained the variants the
+  protocol defines through version 9, and `Feature::ANNOUNCED` names the set
+  the client implements.
+
+
 ## [0.1.1] — 2026-09-05
 
 ### Fixed
@@ -43,6 +82,7 @@ First release.
 - Automatic reconnection with backoff: the handshake is replayed and every
   watcher re-subscribed.
 
-[Unreleased]: https://github.com/voilecx/tarant/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/voilecx/tarant/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/voilecx/tarant/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/voilecx/tarant/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/voilecx/tarant/releases/tag/v0.1.0

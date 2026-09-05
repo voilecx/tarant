@@ -180,6 +180,8 @@ impl ErrorCode {
     pub const UNKNOWN: Self = Self(0);
     /// `ER_ILLEGAL_PARAMS`: the request is malformed or its arguments are wrong.
     pub const ILLEGAL_PARAMS: Self = Self(1);
+    /// `ER_UNSUPPORTED`: the engine or edition does not support the operation.
+    pub const UNSUPPORTED: Self = Self(5);
     /// `ER_TUPLE_FOUND`: `insert` hit an existing key.
     pub const TUPLE_FOUND: Self = Self(3);
     /// `ER_TUPLE_NOT_FOUND`: `update`/`delete` matched nothing.
@@ -188,6 +190,8 @@ impl ErrorCode {
     pub const READONLY: Self = Self(7);
     /// `ER_SPACE_EXISTS`.
     pub const SPACE_EXISTS: Self = Self(10);
+    /// `ER_FIELD_TYPE`: a tuple field does not match the space format.
+    pub const FIELD_TYPE: Self = Self(23);
     /// `ER_PROC_LUA`: a Lua error inside `call`/`eval`.
     pub const PROC_LUA: Self = Self(32);
     /// `ER_NO_SUCH_PROC`: `call` named a function that does not exist.
@@ -206,6 +210,16 @@ impl ErrorCode {
     pub const TIMEOUT: Self = Self(78);
     /// `ER_TRANSACTION_CONFLICT`: MVCC conflict, the transaction should be retried.
     pub const TRANSACTION_CONFLICT: Self = Self(97);
+    /// `ER_NO_SUCH_FIELD_NAME_IN_SPACE`: a JSON path or update named an unknown field.
+    pub const NO_SUCH_FIELD_NAME_IN_SPACE: Self = Self(153);
+    /// `ER_SQL_EXECUTE`: the SQL statement failed while running.
+    pub const SQL_EXECUTE: Self = Self(159);
+    /// `ER_SQL_PREPARE`: the SQL statement could not be parsed or planned.
+    pub const SQL_PREPARE: Self = Self(210);
+    /// `ER_WRONG_QUERY_ID`: the prepared statement is gone (the session that made it ended).
+    pub const WRONG_QUERY_ID: Self = Self(211);
+    /// `ER_SYNC_QUORUM_TIMEOUT`: a synchronous transaction did not reach a quorum in time.
+    pub const SYNC_QUORUM_TIMEOUT: Self = Self(216);
 
     /// The raw number.
     pub const fn as_u32(self) -> u32 {

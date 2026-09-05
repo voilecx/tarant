@@ -68,15 +68,20 @@ mod error;
 mod iproto;
 mod msgpack;
 mod options;
+pub mod sql;
 mod tuple;
+pub mod types;
 mod update;
 mod watcher;
 
-pub use client::{Client, Index, Page, Paged, Select, ServerInfo, Space, Stream, TxOptions};
+pub use client::{
+    Client, Index, Page, Paged, PushCall, Select, ServerInfo, Space, Stream, TxOptions,
+};
 pub use error::{Error, ErrorCode, Result, ServerError};
 pub use iproto::{Feature, Isolation, Iter};
 pub use options::{ConnectOptions, DEFAULT_PORT, Reconnect};
 pub use tuple::{Args, Key};
+pub use types::{Datetime, Decimal, Interval, Uuid};
 pub use update::{FieldRef, Update};
 pub use watcher::Watcher;
 

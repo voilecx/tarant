@@ -10,12 +10,15 @@
 //! Nothing in here is public. The surface a user sees is in `client.rs`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_core::Stream;
+use futures_sink::Sink;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -31,8 +34,9 @@ use crate::options::{ConnectOptions, Reconnect};
 
 /// Commands a handle can send to its connection task.
 pub(crate) enum Command {
-    /// Send a packet and route the reply with the given sync back.
-    Request { sync: u64, packet: Bytes, reply: oneshot::Sender<Result<Response>> },
+    /// Send a packet and route the reply with the given sync back; chunks
+    /// pushed by the server before the reply go to `pushes`, if given.
+    Request { sync: u64, packet: Bytes, reply: Reply, pushes: Option<Pushes> },
     /// Subscribe a watcher to `key`; the first event arrives promptly.
     Watch { id: u64, key: String, sender: watch::Sender<Option<Bytes>> },
     /// Drop a watcher; the server is told when the last one for a key goes.
@@ -49,6 +53,43 @@ pub(crate) struct Negotiated {
     pub(crate) server_version: String,
     pub(crate) protocol_version: u64,
     pub(crate) features: HashSet<Feature>,
+}
+
+/// Where a request's reply goes.
+type Reply = oneshot::Sender<Result<Response>>;
+
+/// Where a request's `box.session.push()` chunks go.
+type Pushes = mpsc::UnboundedSender<Bytes>;
+
+/// The reader side of a request that streams `box.session.push()` chunks.
+pub(crate) struct PushStream {
+    /// Chunks pushed before the reply, in order.
+    pub(crate) pushes: mpsc::UnboundedReceiver<Bytes>,
+    response: oneshot::Receiver<Result<Response>>,
+    request_timeout: Option<Duration>,
+}
+
+impl PushStream {
+    /// Await the final reply, once the pushes are drained (or abandoned).
+    pub(crate) async fn finish(self) -> Result<Response> {
+        let response = match self.request_timeout {
+            Some(limit) => {
+                timeout(limit, self.response).await.map_err(|_| Error::Timeout(limit))?
+            }
+            None => self.response.await,
+        }
+        .map_err(|_| Error::Closed)??;
+        match response.kind {
+            Kind::Error => Err(response.into_error().into()),
+            _ => Ok(response),
+        }
+    }
+}
+
+/// A request waiting for its reply.
+struct Pending {
+    reply: Reply,
+    pushes: Option<Pushes>,
 }
 
 /// One subscriber to a watched key: its id, and where its events go.
@@ -136,11 +177,40 @@ impl Handle {
 
     /// Send a request and wait for its reply. Server errors become [`Error::Server`].
     pub(crate) async fn request(&self, sync: u64, packet: Bytes) -> Result<Response> {
+        self.request_inner(sync, packet, None).await
+    }
+
+    /// Like [`request`](Self::request), but the packet is sent right away and
+    /// the chunks the server pushes before the reply arrive on the returned
+    /// [`PushStream`] as they come. Sending eagerly is what lets a caller
+    /// read pushes before it awaits the reply.
+    pub(crate) async fn request_with_pushes(&self, sync: u64, packet: Bytes) -> Result<PushStream> {
         if self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
         let (reply, response) = oneshot::channel();
-        self.tx.send(Command::Request { sync, packet, reply }).await.map_err(|_| Error::Closed)?;
+        let (pushes, receiver) = mpsc::unbounded_channel();
+        self.tx
+            .send(Command::Request { sync, packet, reply, pushes: Some(pushes) })
+            .await
+            .map_err(|_| Error::Closed)?;
+        Ok(PushStream { pushes: receiver, response, request_timeout: self.request_timeout })
+    }
+
+    async fn request_inner(
+        &self,
+        sync: u64,
+        packet: Bytes,
+        pushes: Option<Pushes>,
+    ) -> Result<Response> {
+        if self.shared.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Command::Request { sync, packet, reply, pushes })
+            .await
+            .map_err(|_| Error::Closed)?;
         let response = match self.request_timeout {
             Some(limit) => timeout(limit, response).await.map_err(|_| Error::Timeout(limit))?,
             None => response.await,
@@ -177,7 +247,7 @@ struct Task {
     options: ConnectOptions,
     rx: mpsc::Receiver<Command>,
     shared: Arc<Shared>,
-    pending: HashMap<u64, oneshot::Sender<Result<Response>>>,
+    pending: HashMap<u64, Pending>,
     watchers: HashMap<String, Vec<Subscriber>>,
     /// Commands that arrived while the link was down.
     deferred: VecDeque<Command>,
@@ -185,6 +255,29 @@ struct Task {
 }
 
 type Link = Framed<TcpStream, Codec>;
+
+// `Framed` is a `Sink`/`Stream`, but the ergonomic `.send()`/`.next()` live on
+// `futures_util`'s extension traits. These three helpers drive the inherent
+// `poll_*` methods through `poll_fn` instead, so the crate needs only the two
+// trait definitions and not the whole `futures_util` toolbox. `Link` is
+// `Unpin`, so `Pin::new` over a mutable borrow is sound without any `unsafe`.
+
+/// Send one packet and flush it, exactly as `SinkExt::send` would.
+async fn send(link: &mut Link, packet: Bytes) -> Result<()> {
+    poll_fn(|cx| Pin::new(&mut *link).poll_ready(cx)).await?;
+    Pin::new(&mut *link).start_send(packet)?;
+    poll_fn(|cx| Pin::new(&mut *link).poll_flush(cx)).await
+}
+
+/// Await the next packet, exactly as `StreamExt::next` would.
+async fn recv(link: &mut Link) -> Option<Result<Response>> {
+    poll_fn(|cx| Pin::new(&mut *link).poll_next(cx)).await
+}
+
+/// Flush and close the sink, exactly as `SinkExt::close` would.
+async fn close(link: &mut Link) -> Result<()> {
+    poll_fn(|cx| Pin::new(&mut *link).poll_close(cx)).await
+}
 
 impl Task {
     async fn run(mut self, mut link: Link) {
@@ -205,7 +298,7 @@ impl Task {
                         Err(err) => Outcome::Lost(err),
                     },
                 },
-                packet = link.next() => match packet {
+                packet = recv(&mut link) => match packet {
                     Some(Ok(response)) => {
                         self.handle_response(&mut link, response).await;
                         if self.shutting_down && self.pending.is_empty() { Outcome::Close } else { Outcome::Continue }
@@ -219,7 +312,7 @@ impl Task {
                 Outcome::Continue => {}
                 Outcome::Close => {
                     self.shared.closed.store(true, Ordering::Release);
-                    let _ = link.close().await;
+                    let _ = close(&mut link).await;
                     self.fail_pending(&Error::Closed);
                     debug!("connection task finished");
                     return;
@@ -240,21 +333,21 @@ impl Task {
 
     async fn handle_command(&mut self, link: &mut Link, command: Command) -> Result<()> {
         match command {
-            Command::Request { sync, packet, reply } => {
+            Command::Request { sync, packet, reply, pushes } => {
                 if self.shutting_down {
                     let _ = reply.send(Err(Error::ShuttingDown));
                     return Ok(());
                 }
-                self.pending.insert(sync, reply);
+                self.pending.insert(sync, Pending { reply, pushes });
                 // On failure the reply is settled by `fail_link` with the rest.
-                link.send(packet).await?;
+                send(link, packet).await?;
             }
-            Command::Fire { packet } => link.send(packet).await?,
+            Command::Fire { packet } => send(link, packet).await?,
             Command::Watch { id, key, sender } => {
                 let first = !self.watchers.contains_key(&key);
                 self.watchers.entry(key.clone()).or_default().push((id, sender));
                 if first {
-                    link.send(watch_packet(request::WATCH, &key)).await?;
+                    send(link, watch_packet(request::WATCH, &key)).await?;
                 }
             }
             Command::Unwatch { id, key } => {
@@ -266,7 +359,7 @@ impl Task {
                 };
                 if gone {
                     self.watchers.remove(&key);
-                    link.send(watch_packet(request::UNWATCH, &key)).await?;
+                    send(link, watch_packet(request::UNWATCH, &key)).await?;
                 }
             }
             Command::Close => unreachable!("Close is handled by the caller"),
@@ -280,15 +373,21 @@ impl Task {
         }
         match response.kind {
             Kind::Ok | Kind::Error => {
-                if let Some(reply) = self.pending.remove(&response.sync) {
-                    let _ = reply.send(Ok(response));
+                if let Some(pending) = self.pending.remove(&response.sync) {
+                    // Dropping `pending.pushes` ends the caller's push stream.
+                    let _ = pending.reply.send(Ok(response));
                 } else {
                     debug!(sync = response.sync, "reply for a request nobody is waiting for");
                 }
             }
             Kind::Chunk => {
-                // `box.session.push()` is not surfaced yet; the final reply still arrives.
-                debug!(sync = response.sync, "ignoring out-of-band chunk");
+                if let Some(pushes) =
+                    self.pending.get(&response.sync).and_then(|p| p.pushes.as_ref())
+                {
+                    let _ = pushes.send(Bytes::copy_from_slice(response.data_bytes()));
+                } else {
+                    debug!(sync = response.sync, "chunk for a request not listening");
+                }
             }
             Kind::Event => {
                 let Some((key, data)) = response.event() else { return };
@@ -301,7 +400,7 @@ impl Task {
                 if let Some(list) = self.watchers.get_mut(&key) {
                     list.retain(|(_, sender)| sender.send(Some(data.clone())).is_ok());
                     // Acknowledge so the server may send the next change.
-                    let _ = link.send(watch_packet(request::WATCH, &key)).await;
+                    let _ = send(link, watch_packet(request::WATCH, &key)).await;
                 }
             }
         }
@@ -313,8 +412,8 @@ impl Task {
     }
 
     fn fail_pending(&mut self, err: &Error) {
-        for (_, reply) in self.pending.drain() {
-            let _ = reply.send(Err(clone_error(err)));
+        for (_, pending) in self.pending.drain() {
+            let _ = pending.reply.send(Err(clone_error(err)));
         }
     }
 
@@ -353,7 +452,7 @@ impl Task {
                 Ok((mut link, negotiated)) => {
                     info!(server = %negotiated.server_version, "reconnected");
                     for key in self.watchers.keys() {
-                        if link.send(watch_packet(request::WATCH, key)).await.is_err() {
+                        if send(&mut link, watch_packet(request::WATCH, key)).await.is_err() {
                             break;
                         }
                     }
@@ -424,13 +523,13 @@ async fn handshake_inner(options: &ConnectOptions) -> Result<(Link, Negotiated)>
     let mut link = Framed::new(stream, Codec);
 
     // IPROTO_ID and IPROTO_AUTH are pipelined; replies come back in order.
-    let features: Vec<u64> = Feature::SUPPORTED.iter().map(|f| f.code()).collect();
+    let features: Vec<u64> = Feature::ANNOUNCED.iter().map(|f| f.code()).collect();
     let id_packet = Request::new(request::ID, 0, None)
         .uint(key::VERSION, PROTOCOL_VERSION)
         .serialized(key::FEATURES, &features, true)?
         .str(key::AUTH_TYPE, auth::CHAP_SHA1)
         .finish();
-    link.send(id_packet).await?;
+    send(&mut link, id_packet).await?;
 
     let user = options.user_name().filter(|user| *user != "guest");
     if let Some(user) = user {
@@ -444,7 +543,7 @@ async fn handshake_inner(options: &ConnectOptions) -> Result<(Link, Negotiated)>
             .str(key::USER_NAME, user)
             .raw(key::TUPLE, &tuple)
             .finish();
-        link.send(auth_packet).await?;
+        send(&mut link, auth_packet).await?;
     }
 
     let id_reply = next_reply(&mut link).await?;
@@ -473,7 +572,7 @@ async fn handshake_inner(options: &ConnectOptions) -> Result<(Link, Negotiated)>
 }
 
 async fn next_reply(link: &mut Link) -> Result<Response> {
-    match link.next().await {
+    match recv(link).await {
         Some(Ok(response)) => Ok(response),
         Some(Err(err)) => Err(err),
         None => Err(Error::Closed),

@@ -76,6 +76,9 @@ name-addressed spaces. `tarant` is written against the 3.x protocol and the
 | Procedures | `call` and `eval` with typed arguments and returns |
 | Transactions | streams, `begin`/`commit`/`rollback`, isolation levels, server-side timeout, rollback on drop |
 | Watchers | `box.broadcast` subscriptions that survive reconnects, plus `watch_once` |
+| SQL | `query`, `execute`, prepared statements, named parameters, on a client or in a transaction |
+| Types | `decimal`, `uuid`, `datetime`, `interval` as first-class values, with `serde` |
+| Session push | `box.session.push` streams read as they arrive |
 | Protocol | feature negotiation, `chap-sha1` auth, graceful-shutdown handling, `MP_ERROR` stacks |
 
 ## Cursor pagination
@@ -139,6 +142,63 @@ Interactive transactions need the server's MVCC transaction manager
 (`database.use_mvcc_engine: true`). Without it, any DML inside a transaction
 aborts it with `TRANSACTION_YIELD`.
 
+A transaction can also be **synchronous** with `TxOptions::new().synchronous()`
+(Tarantool 3.3+): the commit waits for a quorum of replicas to confirm it.
+
+## SQL
+
+SQL runs on the same spaces as everything else, so the two APIs mix freely.
+Statements that return rows go through `query`, the rest through `execute`;
+both decode through `serde` exactly like tuples.
+
+```rust
+use tarant::sql::Named;
+use tarant::Client;
+
+async fn report(client: &Client) -> tarant::Result<()> {
+    let adults: Vec<(u64, String)> = client
+        .query("SELECT id, name FROM users WHERE age >= :min", (Named("min", 18),))
+        .await?
+        .rows;
+
+    let done = client.execute("DELETE FROM sessions WHERE expires < ?", 1_700_000_000u64).await?;
+    println!("removed {} rows", done.row_count);
+
+    // Parse once, run many times.
+    let insert = client.prepare("INSERT INTO events (kind, payload) VALUES (?, ?)").await?;
+    for kind in ["start", "stop"] {
+        insert.execute((kind, "{}")).await?;
+    }
+    Ok(())
+}
+```
+
+A plain value fills the next `?`; a `Named` fills a `:name`. Prepared
+statements survive a reconnect: the next use re-prepares transparently.
+
+## Field types
+
+Tarantool's `decimal`, `uuid`, `datetime` and `interval` are MessagePack
+extensions, not strings or numbers, and a field of that type accepts nothing
+else. Each has a value type that encodes itself correctly, so it drops into a
+tuple `struct` with no attributes:
+
+```rust
+use serde::{Deserialize, Serialize};
+use tarant::{Datetime, Decimal, Interval, Uuid};
+
+#[derive(Serialize, Deserialize)]
+struct Order {
+    id: Uuid,
+    total: Decimal,
+    placed_at: Datetime,
+    valid_for: Interval,
+}
+```
+
+They parse from strings, compare and hash by value, and — behind Cargo
+features — convert to and from the crates you already use.
+
 ## Watchers
 
 A watcher holds the latest value broadcast for a key and wakes when it
@@ -157,6 +217,39 @@ async fn follow_config(client: &Client) -> tarant::Result<()> {
 }
 ```
 
+## Works with `tarantool/queue`
+
+Every [queue](https://github.com/tarantool/queue) operation is a stored
+function whose name carries the tube — `queue.tube.jobs:take` — and
+`call` sends that name verbatim, exactly as `net.box` does:
+
+```rust
+use tarant::{Client, Value};
+
+type Task = (u64, String, String);
+
+async fn work(client: &Client) -> tarant::Result<()> {
+    client.call::<(Task,)>("queue.tube.jobs:put", ("hello", Value::Map(vec![]))).await?;
+    let taken: Vec<Option<Task>> = client.call("queue.tube.jobs:take", 5.0f64).await?;
+    if let Some(Some((id, _state, _data))) = taken.into_iter().next() {
+        client.call::<(Task,)>("queue.tube.jobs:ack", id).await?;
+    }
+    Ok(())
+}
+```
+
+`tests/queue.rs` runs the whole lifecycle — put, take, ack, release, bury,
+kick, delete, statistics — against a live server with the module installed.
+
+One caveat, and it is queue semantics rather than the client's: the queue
+pins a taken task to the session that took it and releases it when that
+session ends. A reconnect opens a new session, so tasks taken before a
+dropped link go back to `ready`, and a later `ack` on them fails with
+"Task was not taken". If acks must survive reconnects, use the queue's
+shared-session protocol: `queue.cfg{ttr = N}`, keep the UUID from
+`queue.identify()` (a 16-byte binary — send it back as `Value::Binary`),
+and re-identify after each reconnect.
+
 ## Compatibility
 
 **Tarantool 3.0 and later.** The client addresses spaces and indexes by name,
@@ -171,7 +264,19 @@ the integration suite against 3.0 and 3.8.
 
 | Flag | Effect |
 |---|---|
-| `uuid` | accept `uuid::Uuid` directly as a key field |
+| `uuid` | convert to and from [`uuid::Uuid`] |
+| `rust_decimal` | convert to and from [`rust_decimal::Decimal`] |
+| `time` | convert `Datetime` to and from [`time::OffsetDateTime`] |
+| `chrono` | convert `Datetime` to and from [`chrono::DateTime`] |
+| `jiff` | convert `Datetime` to and from [`jiff::Timestamp`] and `Zoned` |
+
+None are on by default; the crate's own value types need no dependency.
+
+[`uuid::Uuid`]: https://docs.rs/uuid
+[`rust_decimal::Decimal`]: https://docs.rs/rust_decimal
+[`time::OffsetDateTime`]: https://docs.rs/time
+[`chrono::DateTime`]: https://docs.rs/chrono
+[`jiff::Timestamp`]: https://docs.rs/jiff
 
 ## Testing
 
