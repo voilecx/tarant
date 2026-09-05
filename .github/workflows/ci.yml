@@ -62,3 +62,7 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          # The action builds cargo-audit from source; our -D warnings is
+          # for this crate, not for its dependencies' compiler warnings.
+          RUSTFLAGS: ""
