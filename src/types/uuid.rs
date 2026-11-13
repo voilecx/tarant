@@ -12,7 +12,7 @@ use crate::iproto::ext::UUID;
 ///
 /// This is what a `uuid` field must hold: a plain 16-byte binary or a string
 /// would be rejected by the server. With the `uuid` feature it converts to
-/// and from [`uuid::Uuid`] in both directions.
+/// and from a `uuid::Uuid` in both directions.
 ///
 /// ```
 /// use tarant::Uuid;

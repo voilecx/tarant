@@ -77,8 +77,8 @@ name-addressed spaces. `tarant` is written against the 3.x protocol and the
 | Transactions | streams, `begin`/`commit`/`rollback`, isolation levels, server-side timeout, rollback on drop |
 | Watchers | `box.broadcast` subscriptions that survive reconnects, plus `watch_once` |
 | SQL | `query`, `execute`, prepared statements, named parameters, on a client or in a transaction |
-| Types | `decimal`, `uuid`, `datetime`, `interval` as first-class values, with `serde` |
-| Session push | `box.session.push` streams read as they arrive |
+| Types | `decimal` (up to 76 digits on Tarantool 3.5+), `uuid`, `datetime`, `interval` |
+| Session push | Legacy `box.session.push` chunks; prefer `box.broadcast` and watchers |
 | Protocol | feature negotiation, `chap-sha1` auth, graceful-shutdown handling, `MP_ERROR` stacks |
 
 ## Cursor pagination
@@ -257,6 +257,10 @@ which the protocol gained in 3.0, so there is no schema fetch and no id cache
 to go stale. Against 2.10–2.11, `call`, `eval`, transactions and watchers still
 work; `Client::server_info()` reports what the handshake negotiated. CI runs
 the integration suite against 3.0 and 3.8.
+
+`box.session.push()` is deprecated in Tarantool 3.0 and later. The push API
+remains available for legacy stored procedures; new server code should use
+`box.broadcast()` with [`Client::watch`].
 
 **Rust 1.85 and later** (edition 2024), on tokio 1.x. The `time` feature is
 the one exception: it needs Rust 1.88, which is what `time` 0.3.47 — the

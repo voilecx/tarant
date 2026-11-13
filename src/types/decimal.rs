@@ -1,4 +1,4 @@
-//! Tarantool's `decimal` field type: up to 38 significant digits, exact.
+//! Tarantool's `decimal` field type: up to 76 significant digits, exact.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -15,7 +15,7 @@ use crate::iproto::ext::DECIMAL;
 /// Holds up to [`MAX_DIGITS`](Self::MAX_DIGITS) significant digits and a
 /// scale, so money and measurements survive the round trip untouched. Parse
 /// one from a string, or convert from an integer; with the `rust_decimal`
-/// feature, from a [`rust_decimal::Decimal`] too.
+/// feature, from a `rust_decimal::Decimal` too.
 ///
 /// ```
 /// use tarant::Decimal;
@@ -38,8 +38,8 @@ pub struct Decimal {
 }
 
 impl Decimal {
-    /// The most significant digits Tarantool accepts.
-    pub const MAX_DIGITS: usize = 38;
+    /// The most significant digits Tarantool 3.5 accepts.
+    pub const MAX_DIGITS: usize = 76;
 
     /// The number zero.
     pub fn zero() -> Self {
@@ -49,7 +49,7 @@ impl Decimal {
     /// `mantissa × 10^(-scale)`, e.g. `from_parts(1999, 2)` is `19.99`.
     ///
     /// A negative scale is allowed and means trailing zeros: `from_parts(5, -3)`
-    /// is `5000`. Fails when the mantissa has more than 38 digits.
+    /// is `5000`.
     pub fn from_parts(mantissa: i128, scale: i32) -> Result<Self, DecimalError> {
         let digits: Vec<u8> =
             mantissa.unsigned_abs().to_string().bytes().map(|b| b - b'0').collect();
@@ -77,9 +77,25 @@ impl Decimal {
     }
 
     /// The significant digits as an integer: the value is `mantissa() × 10^(-scale())`.
-    pub fn mantissa(&self) -> i128 {
-        let magnitude = self.digits.iter().fold(0i128, |acc, &d| acc * 10 + i128::from(d));
-        if self.negative { -magnitude } else { magnitude }
+    ///
+    /// Returns an error when the value does not fit in an `i128`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecimalError`] when the significant digits overflow `i128`.
+    pub fn mantissa(&self) -> Result<i128, DecimalError> {
+        let mut magnitude = 0i128;
+        for &digit in &self.digits {
+            magnitude = magnitude
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(i128::from(digit)))
+                .ok_or(DecimalError("mantissa does not fit in i128"))?;
+        }
+        if self.negative {
+            magnitude =
+                magnitude.checked_neg().ok_or(DecimalError("mantissa does not fit in i128"))?;
+        }
+        Ok(magnitude)
     }
 
     /// The nearest `f64`. Lossy for more than 15–17 significant digits.
@@ -94,7 +110,7 @@ impl Decimal {
             return Ok(Self::zero());
         }
         if digits.len() > Self::MAX_DIGITS {
-            return Err(DecimalError("more than 38 significant digits"));
+            return Err(DecimalError("more than 76 significant digits"));
         }
         Ok(Self { negative, scale, digits })
     }
@@ -414,8 +430,17 @@ mod tests {
         assert!(d("-0.1") < d("0"));
         assert!(d("10") > d("9.99999"));
         assert_eq!(d("0.5").cmp(&d("0.5")), Ordering::Equal);
-        assert_eq!(d("1.0").mantissa(), 10);
-        assert_eq!(d("-12.34").mantissa(), -1234);
+        assert_eq!(d("1.0").mantissa().unwrap(), 10);
+        assert_eq!(d("-12.34").mantissa().unwrap(), -1234);
+    }
+
+    #[test]
+    fn supports_tarantool_35_precision() {
+        let text = "1234567890123456789012345678901234567890123456789012345678901234567890123456";
+        let value: Decimal = text.parse().unwrap();
+        assert_eq!(value.precision(), 76);
+        assert_eq!(value.to_string(), text);
+        assert!(value.mantissa().is_err());
     }
 
     #[test]
@@ -423,7 +448,7 @@ mod tests {
         assert!("".parse::<Decimal>().is_err());
         assert!("1.2.3".parse::<Decimal>().is_err());
         assert!("abc".parse::<Decimal>().is_err());
-        assert!("1".repeat(39).parse::<Decimal>().is_err());
+        assert!("1".repeat(77).parse::<Decimal>().is_err());
         assert!(Decimal::from_payload(&[0x02, 0x01, 0x2f, 0x40]).is_err()); // digit 0xf
         assert!(Decimal::from_payload(&[]).is_err());
     }

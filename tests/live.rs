@@ -372,7 +372,7 @@ async fn extension_types_round_trip_through_a_space() {
             .iterator(Iter::Ge)
             .await
             .expect("select");
-        assert!(cheap.is_empty());
+        assert_eq!(cheap.len(), 0);
 
         // The server agrees on what it received.
         let (price, at, span): (String, String, String) = client

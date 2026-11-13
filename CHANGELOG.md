@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-13
+
+### Changed
+
+- `Decimal` now supports Tarantool 3.5's 76-significant-digit values.
+- `Decimal::mantissa()` is fallible because a 76-digit value cannot fit in `i128`.
+- Session-push documentation now marks `box.session.push()` as legacy and
+  recommends `box.broadcast()` with watchers for new server code.
+
 ## [0.2.1] — 2026-09-05
 
 ### Security
@@ -90,7 +99,8 @@ First release.
 - Automatic reconnection with backoff: the handshake is replayed and every
   watcher re-subscribed.
 
-[Unreleased]: https://github.com/voilecx/tarant/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/voilecx/tarant/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/voilecx/tarant/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/voilecx/tarant/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/voilecx/tarant/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/voilecx/tarant/compare/v0.1.0...v0.1.1
