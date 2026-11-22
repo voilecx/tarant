@@ -12,7 +12,7 @@ end to end, and stays out of your way.
 
 ```toml
 [dependencies]
-tarant = "0.1"
+tarant = "0.4"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 ```
@@ -64,7 +64,8 @@ name-addressed spaces. `tarant` is written against the 3.x protocol and the
   Requests that were in flight fail with `Error::Closed`, because the client
   cannot know whether the server ran them.
 - **Nothing unsafe, nothing hidden.** `#![forbid(unsafe_code)]`, every public
-  item documented, zero `clippy::pedantic` and `clippy::nursery` warnings.
+  item documented, clippy `pedantic` and `nursery` clean under the lint
+  table in `Cargo.toml`.
 
 ## What it covers
 

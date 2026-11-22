@@ -6,6 +6,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- `Uuid::from_str` no longer panics or misparses on misplaced hyphens: they
+  are accepted only at byte offsets 8, 13, 18 and 23 of a 36-byte input,
+  and every other byte must be a hex digit.
+- `Decimal` rejects values whose adjusted exponent exceeds the server's
+  decNumber limits (±`Decimal::MAX_EXPONENT`, 999 999) instead of storing
+  an exponent Tarantool would refuse — `1e1000000` now fails to parse.
+- Connection-URL errors no longer echo the URL or the credentials it
+  carried; messages name the host and which credential failed.
+- `ConnectOptions::new` normalises IPv6 literals: `"::1"` and `"[::1]"`
+  become `"[::1]:3301"`, while `"[::1]:3302"` is kept.
+
+### Added
+
+- `Sub` for `Interval` (unit-wise and saturating, like `Add`).
+- `Decimal::MAX_EXPONENT`, the server's bound on the adjusted exponent.
+- `usize` and `isize` as single-field keys.
+
+### Changed
+
+- Breaking: `FieldRef`, `Adjust`, `Page` and `sql::Rows` are now
+  `#[non_exhaustive]`, so later fields and variants are not a breaking
+  change.
+- Breaking: `Space` methods now ask only for what they use — `insert`,
+  `replace` and `upsert` need `Serialize`, `get`, `delete` and `update`
+  need `Deserialize`; a `Deserialize`-only tuple type can be read.
+- A `Decimal` zero keeps a positive scale: `"0.00"` displays as `"0.00"`,
+  still equal to `"0"`.
+- `Key`'s documentation warns that `Vec<u8>`/`&[u8]` encodes as an array
+  of integers, not a `varbinary` field.
+
 ## [0.3.0] — 2026-11-13
 
 ### Changed

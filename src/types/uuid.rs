@@ -79,20 +79,32 @@ impl FromStr for Uuid {
     type Err = UuidError;
 
     /// Accepts the hyphenated form and the bare 32 hex digits, any case.
+    ///
+    /// In the hyphenated form the hyphens sit at byte offsets 8, 13, 18 and
+    /// 23 and nowhere else; the remaining 32 bytes must all be hex digits.
     fn from_str(s: &str) -> Result<Self, UuidError> {
-        let hex: Vec<u8> = match s.len() {
-            36 if s.as_bytes()[8] == b'-'
-                && s.as_bytes()[13] == b'-'
-                && s.as_bytes()[18] == b'-'
-                && s.as_bytes()[23] == b'-' =>
-            {
-                s.bytes().filter(|&b| b != b'-').collect()
+        let mut hex = [0u8; 32];
+        match s.len() {
+            36 => {
+                let bytes = s.as_bytes();
+                if !matches!((bytes[8], bytes[13], bytes[18], bytes[23]), (b'-', b'-', b'-', b'-'))
+                {
+                    return Err(UuidError);
+                }
+                let mut out = 0;
+                for (i, &byte) in bytes.iter().enumerate() {
+                    if matches!(i, 8 | 13 | 18 | 23) {
+                        continue;
+                    }
+                    hex[out] = byte;
+                    out += 1;
+                }
             }
-            32 => s.bytes().collect(),
+            32 => hex.copy_from_slice(s.as_bytes()),
             _ => return Err(UuidError),
-        };
+        }
         let mut bytes = [0u8; 16];
-        for (i, pair) in hex.chunks(2).enumerate() {
+        for (i, pair) in hex.chunks_exact(2).enumerate() {
             let hi = nibble(pair[0]).ok_or(UuidError)?;
             let lo = nibble(pair[1]).ok_or(UuidError)?;
             bytes[i] = (hi << 4) | lo;
@@ -209,6 +221,13 @@ mod tests {
         assert!("not-a-uuid".parse::<Uuid>().is_err());
         assert!("f6423bdf-b49e-4913-b361-0740c9702e4".parse::<Uuid>().is_err());
         assert!("g6423bdfb49e4913b3610740c9702e4b".parse::<Uuid>().is_err());
+        // A hyphen in the wrong place is an error, not a panic.
+        assert!("f6423bdf-b49e-4913-b361-0740c9702e-b".parse::<Uuid>().is_err());
+        assert!("f6423bdf-b49e-4913-b361-0740c9702-4-".parse::<Uuid>().is_err());
+        // 36 bytes with a multi-byte character: the bytes are not hex.
+        let utf8 = "f6423bdf-b49e-4913-b361-0740c970\u{e9}4b";
+        assert_eq!(utf8.len(), 36);
+        assert!(utf8.parse::<Uuid>().is_err());
         assert!(Uuid::NIL.is_nil());
         assert_eq!(Uuid::NIL.to_string(), "00000000-0000-0000-0000-000000000000");
     }

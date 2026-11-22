@@ -383,29 +383,6 @@ impl<T> Space<T> {
     pub fn select(&self, key: impl Key) -> Select<T> {
         Select::new(self.handle.clone(), Arc::clone(&self.name), IndexRef::Id(0), key)
     }
-}
-
-impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Space<T> {
-    /// Insert `tuple`. Fails with [`ErrorCode::TUPLE_FOUND`] if the primary key exists.
-    ///
-    /// [`ErrorCode::TUPLE_FOUND`]: crate::ErrorCode::TUPLE_FOUND
-    pub async fn insert(&self, tuple: &T) -> Result<()> {
-        self.write(request::INSERT, tuple).await
-    }
-
-    /// Insert `tuple`, or overwrite the one with the same primary key.
-    pub async fn replace(&self, tuple: &T) -> Result<()> {
-        self.write(request::REPLACE, tuple).await
-    }
-
-    async fn write(&self, ty: u64, tuple: &T) -> Result<()> {
-        let sync = self.handle.next_sync();
-        let packet = Request::new(ty, sync, None)
-            .str(key::SPACE_NAME, &self.name)
-            .serialized(key::TUPLE, tuple, true)?
-            .finish();
-        self.handle.request(sync, packet).await.map(drop)
-    }
 
     /// Insert every row of an Arrow IPC stream in one request (Tarantool 3.3+).
     ///
@@ -424,11 +401,78 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Space<T> {
             .finish();
         self.handle.request(sync, packet).await.map(drop)
     }
+}
 
+impl<T: Serialize> Space<T> {
+    /// Insert `tuple`. Fails with [`ErrorCode::TUPLE_FOUND`] if the primary key exists.
+    ///
+    /// [`ErrorCode::TUPLE_FOUND`]: crate::ErrorCode::TUPLE_FOUND
+    // `&T` is captured by the future, so `T: !Sync` yields a non-`Send`
+    // future — inherent to a by-reference argument.
+    #[allow(clippy::future_not_send)]
+    pub async fn insert(&self, tuple: &T) -> Result<()> {
+        let (sync, packet) = self.write(request::INSERT, tuple)?;
+        self.handle.request(sync, packet).await.map(drop)
+    }
+
+    /// Insert `tuple`, or overwrite the one with the same primary key.
+    #[allow(clippy::future_not_send)]
+    pub async fn replace(&self, tuple: &T) -> Result<()> {
+        let (sync, packet) = self.write(request::REPLACE, tuple)?;
+        self.handle.request(sync, packet).await.map(drop)
+    }
+
+    /// The tuple is serialised before the await, so `T` need not be `Sync`.
+    fn write(&self, ty: u64, tuple: &T) -> Result<(u64, Bytes)> {
+        let sync = self.handle.next_sync();
+        let packet = Request::new(ty, sync, None)
+            .str(key::SPACE_NAME, &self.name)
+            .serialized(key::TUPLE, tuple, true)?
+            .finish();
+        Ok((sync, packet))
+    }
+
+    /// Insert `tuple`, or apply `ops` to it if its primary key already exists.
+    ///
+    /// Upsert never returns the tuple and never reports a "not found": it is
+    /// a blind write, exactly as Tarantool defines it.
+    #[allow(clippy::future_not_send)]
+    pub async fn upsert(&self, tuple: &T, ops: Update) -> Result<()> {
+        let (sync, packet) = self.upsert_packet(tuple, ops)?;
+        self.handle.request(sync, packet).await.map(drop)
+    }
+
+    fn upsert_packet(&self, tuple: &T, ops: Update) -> Result<(u64, Bytes)> {
+        let sync = self.handle.next_sync();
+        let packet = Request::new(request::UPSERT, sync, None)
+            .str(key::SPACE_NAME, &self.name)
+            .uint(key::INDEX_BASE, 1)
+            .serialized(key::TUPLE, tuple, true)?
+            .raw_array(key::OPS, &ops.into_ops()?)
+            .finish();
+        Ok((sync, packet))
+    }
+}
+
+impl<T: DeserializeOwned + Send + 'static> Space<T> {
     /// Fetch the tuple whose primary key equals `key`, if any.
     ///
     /// `key` follows the [`Key`] rules: a scalar for a one-field primary key,
-    /// a tuple for a composite one.
+    /// a tuple for a composite one. Reads need only `Deserialize` on `T` —
+    /// a type that cannot serialise can still be fetched:
+    ///
+    /// ```no_run
+    /// # use tarant::Client;
+    /// // `Deserialize` only: `insert` is unavailable, `get` works.
+    /// #[derive(serde::Deserialize)]
+    /// struct Row {
+    ///     id: u64,
+    /// }
+    /// # async fn demo(client: Client) -> tarant::Result<()> {
+    /// let rows = client.space::<Row>("rows");
+    /// let row: Option<Row> = rows.get(1u64).await?;
+    /// # Ok(()) }
+    /// ```
     pub async fn get(&self, key: impl Key) -> Result<Option<T>> {
         let rows: Vec<T> = self.select(key).iterator(Iter::Eq).limit(1).await?;
         Ok(rows.into_iter().next())
@@ -460,21 +504,6 @@ impl<T: Serialize + DeserializeOwned + Send + Sync + 'static> Space<T> {
             .finish();
         let rows: Vec<T> = self.handle.request(sync, packet).await?.data()?;
         Ok(rows.into_iter().next())
-    }
-
-    /// Insert `tuple`, or apply `ops` to it if its primary key already exists.
-    ///
-    /// Upsert never returns the tuple and never reports a "not found": it is
-    /// a blind write, exactly as Tarantool defines it.
-    pub async fn upsert(&self, tuple: &T, ops: Update) -> Result<()> {
-        let sync = self.handle.next_sync();
-        let packet = Request::new(request::UPSERT, sync, None)
-            .str(key::SPACE_NAME, &self.name)
-            .uint(key::INDEX_BASE, 1)
-            .serialized(key::TUPLE, tuple, true)?
-            .raw_array(key::OPS, &ops.into_ops()?)
-            .finish();
-        self.handle.request(sync, packet).await.map(drop)
     }
 }
 
@@ -668,6 +697,7 @@ enum After {
 
 /// One page of a [`Select::page`] walk: the rows, and where to resume.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Page<T> {
     /// The tuples this page returned, in index order.
     pub rows: Vec<T>,

@@ -17,6 +17,7 @@ use crate::error::Result;
 /// Built implicitly from `i32` and `&str`, so `update.set(2, v)` and
 /// `update.set("[2].name", v)` both read naturally.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FieldRef {
     /// A 1-based field number; negative counts from the end.
     Number(i32),

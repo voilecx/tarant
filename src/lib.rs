@@ -47,7 +47,12 @@
 //!
 //! # Feature flags
 //!
-//! * `uuid` — accept `uuid::Uuid` directly as a key field.
+//! * `uuid` — convert to and from `uuid::Uuid`.
+//! * `rust_decimal` — convert to and from `rust_decimal::Decimal`.
+//! * `time` — convert `Datetime` to and from `time::OffsetDateTime`
+//!   (requires Rust 1.88).
+//! * `chrono` — convert `Datetime` to and from `chrono::DateTime`.
+//! * `jiff` — convert `Datetime` to and from `jiff::Timestamp` and `Zoned`.
 //!
 //! # Compatibility
 //!
@@ -58,7 +63,6 @@
 //! reports what the handshake negotiated.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs, rust_2018_idioms)]
 
 mod auth;
 mod client;

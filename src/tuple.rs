@@ -30,6 +30,10 @@ pub(crate) use sealed::ArrayLike;
 /// type `()` is the empty key, which every iterator except `Eq`/`Req`
 /// accepts to mean "from the start".
 ///
+/// A `Vec<u8>`/`&[u8]` is a key of N integer fields — `serde` encodes
+/// bytes as an array — not one `varbinary` field. For that, use
+/// [`Value::Binary`] (or a `serde_bytes` wrapper inside a tuple).
+///
 /// ```
 /// # fn takes_key<K: tarant::Key>(_: K) {}
 /// takes_key(42u64);                    // single-field key
@@ -73,7 +77,7 @@ macro_rules! scalar_keys {
     )*};
 }
 
-scalar_keys!(u8, u16, u32, u64, i8, i16, i32, i64, f32, f64, bool, str, String);
+scalar_keys!(u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, f32, f64, bool, str, String);
 scalar_keys!(Decimal, Datetime, Interval, Uuid);
 
 #[cfg(feature = "uuid")]

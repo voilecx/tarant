@@ -1,7 +1,7 @@
 //! Tarantool's `interval` type: a calendar span, field by field.
 
 use std::fmt;
-use std::ops::{Add, Neg};
+use std::ops::{Add, Neg, Sub};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -48,6 +48,7 @@ pub struct Interval {
 /// Adding one month to January 31st needs a decision; these are Tarantool's
 /// three, under the names it gives them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Adjust {
     /// Tarantool's `'none'`, and the default: clamp to the last day, so
     /// January 31st plus a month is February 28th (or 29th).
@@ -254,6 +255,16 @@ impl Add for Interval {
     }
 }
 
+impl Sub for Interval {
+    type Output = Self;
+
+    /// `self + (-rhs)`, unit-wise and saturating, so the `adjust` rule is
+    /// the same as for [`Add`].
+    fn sub(self, rhs: Self) -> Self {
+        self + (-rhs)
+    }
+}
+
 impl Neg for Interval {
     type Output = Self;
 
@@ -364,6 +375,8 @@ mod tests {
         let span = Interval::hours(1) + Interval::minutes(-30) + Interval::nanoseconds(5);
         assert_eq!(span.to_string(), "+1 hours, -30 minutes, 5 nanoseconds");
         assert_eq!((-span).minutes, 30);
+        assert_eq!(Interval::days(7) - Interval::days(2), Interval::days(5));
+        assert_eq!(Interval::hours(1) - Interval::minutes(30), span - Interval::nanoseconds(5));
         assert_eq!(
             (Interval::days(1).with_adjust(Adjust::Snap) + Interval::days(1)).adjust,
             Adjust::Snap

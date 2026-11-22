@@ -37,11 +37,23 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
-    /// Options for `addr` (`host:port` or a bare host on port 3301), as the
-    /// `guest` user, with defaults everywhere else.
+    /// Options for `addr`, as the `guest` user, with defaults everywhere else.
+    ///
+    /// The address may be `host`, `host:port`, or an IPv6 literal in any of
+    /// its spellings: `"::1"`, `"[::1]"` and `"[::1]:3302"` all work. A bare
+    /// host or a bare/bracketed literal gets the default port appended; a
+    /// bracketed literal with a port is kept as is.
     pub fn new(addr: impl Into<String>) -> Self {
         let addr = addr.into();
-        let addr = if addr.contains(':') { addr } else { format!("{addr}:{DEFAULT_PORT}") };
+        let addr = if addr.starts_with('[') {
+            if addr.contains("]:") { addr } else { format!("{addr}:{DEFAULT_PORT}") }
+        } else {
+            match addr.matches(':').count() {
+                0 => format!("{addr}:{DEFAULT_PORT}"),
+                1 => addr,
+                _ => format!("[{addr}]:{DEFAULT_PORT}"),
+            }
+        };
         Self {
             addr,
             user: None,
@@ -64,10 +76,10 @@ impl ConnectOptions {
             None => (None, rest),
         };
         if host.is_empty() {
-            return Err(Error::Url(format!("no host in `{url}`")));
+            return Err(Error::Url(String::from("no host")));
         }
         if host.contains('/') {
-            return Err(Error::Url(format!("unexpected path in `{url}`")));
+            return Err(Error::Url(format!("unexpected path after host `{host}`")));
         }
         let mut options = Self::new(host);
         if let Some(credentials) = credentials {
@@ -75,8 +87,8 @@ impl ConnectOptions {
                 Some((user, password)) => (user, Some(password)),
                 None => (credentials, None),
             };
-            options.user = Some(percent_decode(user)?);
-            options.password = password.map(percent_decode).transpose()?;
+            options.user = Some(percent_decode(user, "user name")?);
+            options.password = password.map(|p| percent_decode(p, "password")).transpose()?;
         }
         Ok(options)
     }
@@ -206,7 +218,7 @@ impl Default for Reconnect {
     }
 }
 
-fn percent_decode(input: &str) -> Result<String> {
+fn percent_decode(input: &str, what: &'static str) -> Result<String> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -217,7 +229,7 @@ fn percent_decode(input: &str) -> Result<String> {
                     .get(i + 1..i + 3)
                     .and_then(|h| std::str::from_utf8(h).ok())
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
-                    .ok_or_else(|| Error::Url(format!("bad percent-escape in `{input}`")))?;
+                    .ok_or_else(|| Error::Url(format!("bad percent-escape in {what}")))?;
                 out.push(hex);
                 i += 3;
             }
@@ -227,7 +239,7 @@ fn percent_decode(input: &str) -> Result<String> {
             }
         }
     }
-    String::from_utf8(out).map_err(|_| Error::Url(format!("`{input}` is not valid UTF-8")))
+    String::from_utf8(out).map_err(|_| Error::Url(format!("{what} is not valid UTF-8")))
 }
 
 #[cfg(test)]
@@ -254,6 +266,24 @@ mod tests {
     fn rejects_paths_and_empty_hosts() {
         assert!(matches!(ConnectOptions::parse("tarantool://"), Err(Error::Url(_))));
         assert!(matches!(ConnectOptions::parse("tarantool://h:1/db"), Err(Error::Url(_))));
+    }
+
+    #[test]
+    fn errors_never_echo_the_url_or_credentials() {
+        let err = ConnectOptions::parse("tarantool://app:secret@host/db").unwrap_err();
+        assert!(!err.to_string().contains("secret"), "{err}");
+        let err = ConnectOptions::parse("tarantool://app:se%zzcret@host").unwrap_err();
+        assert!(!err.to_string().contains("se%zz"), "{err}");
+        assert_eq!(err.to_string(), "invalid connection url: bad percent-escape in password");
+    }
+
+    #[test]
+    fn new_normalises_ipv6_literals() {
+        assert_eq!(ConnectOptions::new("::1").addr(), "[::1]:3301");
+        assert_eq!(ConnectOptions::new("[::1]").addr(), "[::1]:3301");
+        assert_eq!(ConnectOptions::new("[::1]:3302").addr(), "[::1]:3302");
+        assert_eq!(ConnectOptions::new("db").addr(), "db:3301");
+        assert_eq!(ConnectOptions::new("db:1").addr(), "db:1");
     }
 
     #[test]

@@ -41,6 +41,11 @@ impl Decimal {
     /// The most significant digits Tarantool 3.5 accepts.
     pub const MAX_DIGITS: usize = 76;
 
+    /// The widest adjusted exponent (`exponent + digits − 1`) the server
+    /// accepts, from its decNumber limits. `1e999999` parses, `1e1000000`
+    /// does not.
+    pub const MAX_EXPONENT: i32 = 999_999;
+
     /// The number zero.
     pub fn zero() -> Self {
         Self { negative: false, scale: 0, digits: vec![0] }
@@ -107,10 +112,19 @@ impl Decimal {
         let leading = digits.iter().take_while(|&&d| d == 0).count();
         digits.drain(..leading);
         if digits.is_empty() {
-            return Ok(Self::zero());
+            // Zero keeps a positive scale ("0.00" displays as "0.00") but is
+            // never negative, and a negative scale means nothing to it.
+            if scale > Self::MAX_EXPONENT {
+                return Err(DecimalError("exponent out of range"));
+            }
+            return Ok(Self { negative: false, scale: scale.max(0), digits: vec![0] });
         }
         if digits.len() > Self::MAX_DIGITS {
             return Err(DecimalError("more than 76 significant digits"));
+        }
+        let adjusted = i64::try_from(digits.len()).unwrap_or(i64::MAX) - 1 - i64::from(scale);
+        if !(-i64::from(Self::MAX_EXPONENT)..=i64::from(Self::MAX_EXPONENT)).contains(&adjusted) {
+            return Err(DecimalError("exponent out of range"));
         }
         Ok(Self { negative, scale, digits })
     }
@@ -418,6 +432,55 @@ mod tests {
         assert_eq!("1e3".parse::<Decimal>().unwrap().to_string(), "1000");
         assert_eq!("-0".parse::<Decimal>().unwrap().to_string(), "0");
         assert_eq!(Decimal::from(-42i64).to_string(), "-42");
+    }
+
+    #[test]
+    fn zero_keeps_a_positive_scale() {
+        let zero: Decimal = "0.00".parse().unwrap();
+        assert_eq!(zero.scale(), 2);
+        assert_eq!(zero.to_string(), "0.00");
+        assert!(zero.is_zero());
+        assert!(!zero.is_negative());
+        // Still numerically equal, hash-equal and ordered-equal to "0".
+        let plain: Decimal = "0".parse().unwrap();
+        assert_eq!(zero, plain);
+        assert_eq!(zero.cmp(&plain), Ordering::Equal);
+        assert_eq!(
+            {
+                let mut a = std::collections::hash_map::DefaultHasher::new();
+                zero.hash(&mut a);
+                a.finish()
+            },
+            {
+                let mut b = std::collections::hash_map::DefaultHasher::new();
+                plain.hash(&mut b);
+                b.finish()
+            }
+        );
+        // A negative or absent scale on zero normalises to 0.
+        assert_eq!(Decimal::from_parts(0, -5).unwrap().scale(), 0);
+        assert_eq!("-0.00".parse::<Decimal>().unwrap().to_string(), "0.00");
+        // And the payload round-trips.
+        assert_eq!(zero.to_payload(), [0x02, 0x0c]);
+        assert_eq!(Decimal::from_payload(&[0x02, 0x0c]).unwrap(), zero);
+    }
+
+    #[test]
+    fn bounds_the_adjusted_exponent_like_the_server() {
+        assert_eq!("1e999999".parse::<Decimal>().unwrap().scale(), -999_999);
+        assert!("1e1000000".parse::<Decimal>().is_err());
+        assert!("1e2147483647".parse::<Decimal>().is_err());
+        assert!("1e-1000100".parse::<Decimal>().is_err());
+        // Zero with an out-of-range positive scale fails too; a negative
+        // one is meaningless and normalises instead.
+        assert!("0e-1000000".parse::<Decimal>().is_err());
+        // From a payload too: scale -2_000_000 on a non-zero mantissa.
+        let mut payload = Vec::new();
+        rmp::encode::write_sint(&mut payload, -2_000_000).unwrap();
+        payload.push(0x1c); // digit 1, sign '+'
+        assert!(Decimal::from_payload(&payload).is_err());
+        assert!(Decimal::from_parts(1, -1_000_000).is_err());
+        assert!(Decimal::from_parts(0, 1_000_000).is_err());
     }
 
     #[test]

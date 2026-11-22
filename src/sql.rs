@@ -89,6 +89,7 @@ pub struct Column {
 
 /// The result of a `SELECT`, `VALUES` or `PRAGMA`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Rows<T> {
     /// A description of each column, in row order.
     pub columns: Vec<Column>,

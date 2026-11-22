@@ -109,6 +109,9 @@ impl Error {
     ///
     /// True for transport failures and timeouts, false for anything the
     /// server decided on purpose (bad arguments, access denied, conflicts).
+    /// Beware what a retry means after `Timeout` (or `Closed` on a request
+    /// that was in flight): the server may still have executed it, so only
+    /// retry requests that are idempotent.
     pub const fn is_transient(&self) -> bool {
         matches!(self, Self::Io(_) | Self::Closed | Self::Timeout(_))
     }
@@ -180,12 +183,13 @@ impl ErrorCode {
     pub const UNKNOWN: Self = Self(0);
     /// `ER_ILLEGAL_PARAMS`: the request is malformed or its arguments are wrong.
     pub const ILLEGAL_PARAMS: Self = Self(1);
-    /// `ER_UNSUPPORTED`: the engine or edition does not support the operation.
-    pub const UNSUPPORTED: Self = Self(5);
     /// `ER_TUPLE_FOUND`: `insert` hit an existing key.
     pub const TUPLE_FOUND: Self = Self(3);
-    /// `ER_TUPLE_NOT_FOUND`: `update`/`delete` matched nothing.
+    /// `ER_TUPLE_NOT_FOUND`. Current servers do not raise it — `update` and
+    /// `delete` of a missing key return `Ok(None)` — but old ones did.
     pub const TUPLE_NOT_FOUND: Self = Self(4);
+    /// `ER_UNSUPPORTED`: the engine or edition does not support the operation.
+    pub const UNSUPPORTED: Self = Self(5);
     /// `ER_READONLY`: the instance is read-only.
     pub const READONLY: Self = Self(7);
     /// `ER_SPACE_EXISTS`.
