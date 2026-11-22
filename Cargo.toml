@@ -1,6 +1,6 @@
 [package]
 name = "tarant"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.85"
 description = "An async Tarantool client: native iproto, typed end to end, no unsafe"

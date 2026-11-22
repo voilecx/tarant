@@ -60,9 +60,11 @@ name-addressed spaces. `tarant` is written against the 3.x protocol and the
   the numeric `ErrorCode` and the full error stack. Match on
   `ErrorCode::TUPLE_FOUND`, never on a message string.
 - **Reconnects that keep their promises.** A dropped link is re-established
-  with backoff, the handshake replayed and every watcher re-subscribed.
-  Requests that were in flight fail with `Error::Closed`, because the client
-  cannot know whether the server ran them.
+  with backoff and jitter, the handshake replayed and every watcher
+  re-subscribed; a `box.shutdown` announcement drains in-flight requests and
+  reconnects cleanly. Requests that were in flight fail with `Error::Closed`,
+  because the client cannot know whether the server ran them, and a request
+  whose caller already timed out never reaches the wire.
 - **Nothing unsafe, nothing hidden.** `#![forbid(unsafe_code)]`, every public
   item documented, clippy `pedantic` and `nursery` clean under the lint
   table in `Cargo.toml`.
@@ -138,6 +140,11 @@ async fn transfer(client: &Client) -> tarant::Result<()> {
 
 Dropping the stream mid-transaction sends a rollback, so an abandoned
 transaction does not hold locks until its timeout.
+
+A transaction lives and dies with its connection. If the link drops and is
+re-established, the server has already rolled the transaction back: every
+further request on that stream — including `commit` — fails with
+`Error::Closed` instead of running outside the transaction.
 
 Interactive transactions need the server's MVCC transaction manager
 (`database.use_mvcc_engine: true`). Without it, any DML inside a transaction
@@ -250,6 +257,17 @@ dropped link go back to `ready`, and a later `ack` on them fails with
 shared-session protocol: `queue.cfg{ttr = N}`, keep the UUID from
 `queue.identify()` (a 16-byte binary — send it back as `Value::Binary`),
 and re-identify after each reconnect.
+
+## Timeouts and keepalive
+
+Every request honours `ConnectOptions::request_timeout`; on timeout the
+reply is dropped and the request never reaches the server late.
+`ConnectOptions::keepalive(interval)` sends `IPROTO_PING` when a link has
+been silent for `interval`, and drops it as dead after a second silent
+interval — useful behind load balancers, but a server whose TX thread is
+blocked that long will look dead. `ConnectOptions::max_packet_size` caps the
+largest response frame accepted (default: the protocol maximum, 2 GiB);
+lower it when the server is not fully trusted.
 
 ## Compatibility
 

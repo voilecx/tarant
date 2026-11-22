@@ -32,6 +32,16 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::iproto::{key, request, sql};
 use crate::tuple::{Args, encode_array};
 
+/// A stream's request scope: its id, plus the connection generation the
+/// current transaction is pinned to (set by `Stream::begin`, cleared on
+/// commit/rollback). Requests carrying `generation` are refused if the
+/// link they were meant for is already gone.
+#[derive(Clone, Copy)]
+pub(crate) struct StreamScope {
+    pub(crate) id: u64,
+    pub(crate) generation: Option<u64>,
+}
+
 /// A named parameter: `Named("min", 18)` fills `:min` in the statement.
 ///
 /// Positional `?` parameters take plain values; the two kinds can be mixed
@@ -171,33 +181,38 @@ impl Statement {
     pub async fn unprepare(mut self) -> Result<()> {
         self.released = true;
         let sync = self.handle.next_sync();
-        self.handle.request(sync, self.unprepare_packet(sync)).await.map(drop)
+        let packet = self.unprepare_packet(sync)?;
+        self.handle.request(sync, packet).await.map(drop)
     }
 
-    pub(crate) async fn run(&self, stream: Option<u64>, params: impl Args) -> Result<Response> {
+    pub(crate) async fn run(
+        &self,
+        scope: Option<StreamScope>,
+        params: impl Args,
+    ) -> Result<Response> {
         let bind = encode_array(&params)?;
-        match self.send(stream, &bind).await {
+        match self.send(scope, &bind).await {
             Err(Error::Server(err)) if err.code == ErrorCode::WRONG_QUERY_ID => {
                 // The session that prepared this is gone: the connection was
                 // re-established. Prepare again, then retry once.
                 let fresh = send_prepare(&self.handle, &self.sql).await?;
                 self.id.store(statement_id(&fresh)?, Ordering::Relaxed);
-                self.send(stream, &bind).await
+                self.send(scope, &bind).await
             }
             other => other,
         }
     }
 
-    async fn send(&self, stream: Option<u64>, bind: &[u8]) -> Result<Response> {
+    async fn send(&self, scope: Option<StreamScope>, bind: &[u8]) -> Result<Response> {
         let sync = self.handle.next_sync();
-        let packet = Request::new(request::EXECUTE, sync, stream)
+        let packet = Request::new(request::EXECUTE, sync, scope.map(|s| s.id))
             .uint(key::STMT_ID, self.id.load(Ordering::Relaxed))
             .raw(key::SQL_BIND, bind)
-            .finish();
-        self.handle.request(sync, packet).await
+            .finish()?;
+        self.handle.request_in(sync, packet, scope.and_then(|s| s.generation)).await
     }
 
-    fn unprepare_packet(&self, sync: u64) -> Bytes {
+    fn unprepare_packet(&self, sync: u64) -> Result<Bytes> {
         Request::new(request::PREPARE, sync, None)
             .uint(key::STMT_ID, self.id.load(Ordering::Relaxed))
             .finish()
@@ -208,7 +223,9 @@ impl Drop for Statement {
     fn drop(&mut self) {
         if !self.released {
             // Best effort, like a rollback from Drop: nothing can be awaited here.
-            self.handle.fire(self.unprepare_packet(self.handle.next_sync()));
+            if let Ok(packet) = self.unprepare_packet(self.handle.next_sync()) {
+                self.handle.fire(packet, None);
+            }
         }
     }
 }
@@ -225,21 +242,21 @@ impl fmt::Debug for Statement {
 /// Run `sql` as text, optionally inside a stream.
 pub(crate) async fn run_text(
     handle: &Handle,
-    stream: Option<u64>,
+    scope: Option<StreamScope>,
     sql: &str,
     params: impl Args,
 ) -> Result<Response> {
     let sync = handle.next_sync();
-    let packet = Request::new(request::EXECUTE, sync, stream)
+    let packet = Request::new(request::EXECUTE, sync, scope.map(|s| s.id))
         .str(key::SQL_TEXT, sql)
         .array(key::SQL_BIND, &params)?
-        .finish();
-    handle.request(sync, packet).await
+        .finish()?;
+    handle.request_in(sync, packet, scope.and_then(|s| s.generation)).await
 }
 
 async fn send_prepare(handle: &Handle, sql: &str) -> Result<Response> {
     let sync = handle.next_sync();
-    let packet = Request::new(request::PREPARE, sync, None).str(key::SQL_TEXT, sql).finish();
+    let packet = Request::new(request::PREPARE, sync, None).str(key::SQL_TEXT, sql).finish()?;
     handle.request(sync, packet).await
 }
 

@@ -98,18 +98,26 @@ pub(crate) struct MapCursor<'a> {
 impl<'a> MapCursor<'a> {
     /// Start walking the map at the beginning of `buf`.
     ///
-    /// Returns the cursor and the offset just past the whole map, so the
-    /// caller can keep parsing whatever follows.
-    pub(crate) fn new(buf: &'a [u8]) -> Result<(Self, usize)> {
-        let total = value_len(buf)?;
-        let marker = buf[0];
+    /// Only the map header is read; entries are validated as [`next`](Self::next)
+    /// walks them, so a truncated map fails on the missing entry rather than
+    /// on a whole-map pre-scan.
+    pub(crate) fn new(buf: &'a [u8]) -> Result<Self> {
+        let marker = *buf.first().ok_or_else(|| Error::protocol("expected a MessagePack map"))?;
         let (remaining, header) = match marker {
             0x80..=0x8f => (usize::from(marker & 0x0f), 1),
             0xde => (read_len(buf, 1, 2)?, 3),
             0xdf => (read_len(buf, 1, 4)?, 5),
             _ => return Err(Error::protocol("expected a MessagePack map")),
         };
-        Ok((MapCursor { buf, pos: header, remaining }, total))
+        Ok(MapCursor { buf, pos: header, remaining })
+    }
+
+    /// The offset just past the last entry walked.
+    ///
+    /// Meaningful once [`next`](Self::next) has returned `None`: it is then
+    /// the end of the whole map, where whatever follows it begins.
+    pub(crate) const fn end(&self) -> usize {
+        self.pos
     }
 
     /// The next entry as `(key, value offset, value bytes)`, or `None` when
@@ -146,6 +154,21 @@ pub(crate) fn read_str(value: &[u8]) -> Result<&str> {
         rmp::decode::read_str_len(&mut cursor).map_err(|_| Error::protocol("expected a string"))?;
     let bytes = cursor.get(..len as usize).ok_or_else(|| Error::protocol("string is truncated"))?;
     std::str::from_utf8(bytes).map_err(|_| Error::protocol("string is not UTF-8"))
+}
+
+/// Like [`read_str`], but invalid UTF-8 becomes U+FFFD instead of an error.
+///
+/// For text the server produced — error messages, broadcast keys — where
+/// losing the whole packet over a byte the server wrote helps no one.
+pub(crate) fn read_str_lossy(value: &[u8]) -> Result<std::borrow::Cow<'_, str>> {
+    let mut cursor = value;
+    let len =
+        rmp::decode::read_str_len(&mut cursor).map_err(|_| Error::protocol("expected a string"))?;
+    let bytes = cursor.get(..len as usize).ok_or_else(|| Error::protocol("string is truncated"))?;
+    Ok(match std::str::from_utf8(bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => String::from_utf8_lossy(bytes),
+    })
 }
 
 #[cfg(test)]
@@ -198,8 +221,7 @@ mod tests {
             (Value::from(0x30), Value::Array(vec![Value::from(1)])),
             (Value::from(0x05), Value::from(42)),
         ]));
-        let (mut cursor, total) = MapCursor::new(&bytes).unwrap();
-        assert_eq!(total, bytes.len());
+        let mut cursor = MapCursor::new(&bytes).unwrap();
         let (k, offset, v) = cursor.next().unwrap().unwrap();
         assert_eq!(k, 0x30);
         assert_eq!(v, &encoded(&Value::Array(vec![Value::from(1)]))[..]);
@@ -208,5 +230,14 @@ mod tests {
         assert_eq!(k, 0x05);
         assert_eq!(read_uint(v).unwrap(), 42);
         assert!(cursor.next().unwrap().is_none());
+        assert_eq!(cursor.end(), bytes.len());
+    }
+
+    #[test]
+    fn map_cursor_fails_on_a_truncated_body() {
+        // One-entry map declaring a 300-byte string it does not carry.
+        let bytes = [0x81, 0x01, 0xda, 0x01, 0x2c, b'x'];
+        let mut cursor = MapCursor::new(&bytes).unwrap();
+        assert!(cursor.next().is_err());
     }
 }

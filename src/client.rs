@@ -90,7 +90,7 @@ impl Client {
         let packet = Request::new(request::CALL, sync, None)
             .str(key::FUNCTION_NAME, name)
             .array(key::TUPLE, &args)?
-            .finish();
+            .finish()?;
         self.handle.request(sync, packet).await?.data()
     }
 
@@ -104,7 +104,7 @@ impl Client {
         let packet = Request::new(request::EVAL, sync, None)
             .str(key::EXPR, expr)
             .array(key::TUPLE, &args)?
-            .finish();
+            .finish()?;
         self.handle.request(sync, packet).await?.data()
     }
 
@@ -134,7 +134,7 @@ impl Client {
         let packet = Request::new(request::CALL, sync, None)
             .str(key::FUNCTION_NAME, name)
             .array(key::TUPLE, &args)?
-            .finish();
+            .finish()?;
         PushCall::start(&self.handle, sync, packet).await
     }
 
@@ -148,7 +148,7 @@ impl Client {
         let packet = Request::new(request::EVAL, sync, None)
             .str(key::EXPR, expr)
             .array(key::TUPLE, &args)?
-            .finish();
+            .finish()?;
         PushCall::start(&self.handle, sync, packet).await
     }
 
@@ -209,7 +209,7 @@ impl Client {
     /// Round-trip a `ping`. Cheap; useful as a liveness probe.
     pub async fn ping(&self) -> Result<()> {
         let sync = self.handle.next_sync();
-        let packet = Request::new(request::PING, sync, None).finish();
+        let packet = Request::new(request::PING, sync, None).finish()?;
         self.handle.request(sync, packet).await.map(drop)
     }
 
@@ -224,6 +224,7 @@ impl Client {
             handle: self.handle.clone(),
             id: self.handle.next_stream_id(),
             in_transaction: false,
+            tx_generation: 0,
         }
     }
 
@@ -246,11 +247,15 @@ impl Client {
         }
         let sync = self.handle.next_sync();
         let packet =
-            Request::new(request::WATCH_ONCE, sync, None).str(key::EVENT_KEY, key).finish();
+            Request::new(request::WATCH_ONCE, sync, None).str(key::EVENT_KEY, key).finish()?;
         self.handle.request(sync, packet).await?.data()
     }
 
     /// What the handshake negotiated: server version, protocol version, features.
+    ///
+    /// A snapshot of the *first* handshake; a reconnect may negotiate a
+    /// different feature set, which [`ServerInfo::supports`] does not
+    /// reflect.
     pub fn server_info(&self) -> ServerInfo<'_> {
         ServerInfo { negotiated: self.handle.negotiated() }
     }
@@ -309,6 +314,9 @@ impl ServerInfo<'_> {
 /// Read the pushes with [`next_push`](Self::next_push) until it yields
 /// `None`, then take the return value with [`finish`](Self::finish).
 /// Finishing early drops the pushes not yet read.
+///
+/// Pushes buffer up to 1024 unread chunks; a consumer slower than that
+/// fails the request rather than growing memory without bound.
 #[must_use = "a PushCall does nothing until its pushes are read or it is finished"]
 pub struct PushCall<R> {
     stream: PushStream,
@@ -370,6 +378,15 @@ impl<T> Space<T> {
         }
     }
 
+    /// `Error::Unsupported` when the server predates addressing by name.
+    fn check_names(&self) -> Result<()> {
+        if self.handle.supports(Feature::SpaceAndIndexNames) {
+            Ok(())
+        } else {
+            Err(Error::Unsupported("spaces addressed by name (server is older than 3.0)"))
+        }
+    }
+
     /// Start a select over the primary index. See [`Select`].
     ///
     /// ```no_run
@@ -391,6 +408,7 @@ impl<T> Space<T> {
     /// format by name. Rows are inserted as one batch; a duplicate key
     /// rejects the whole request.
     pub async fn insert_arrow(&self, ipc: &[u8]) -> Result<()> {
+        self.check_names()?;
         if !self.handle.supports(Feature::InsertArrow) {
             return Err(Error::Unsupported("Arrow insert (server is older than 3.3)"));
         }
@@ -398,7 +416,7 @@ impl<T> Space<T> {
         let packet = Request::new(request::INSERT_ARROW, sync, None)
             .str(key::SPACE_NAME, &self.name)
             .ext(key::ARROW, ext::ARROW, ipc)?
-            .finish();
+            .finish()?;
         self.handle.request(sync, packet).await.map(drop)
     }
 }
@@ -424,11 +442,12 @@ impl<T: Serialize> Space<T> {
 
     /// The tuple is serialised before the await, so `T` need not be `Sync`.
     fn write(&self, ty: u64, tuple: &T) -> Result<(u64, Bytes)> {
+        self.check_names()?;
         let sync = self.handle.next_sync();
         let packet = Request::new(ty, sync, None)
             .str(key::SPACE_NAME, &self.name)
             .serialized(key::TUPLE, tuple, true)?
-            .finish();
+            .finish()?;
         Ok((sync, packet))
     }
 
@@ -443,13 +462,14 @@ impl<T: Serialize> Space<T> {
     }
 
     fn upsert_packet(&self, tuple: &T, ops: Update) -> Result<(u64, Bytes)> {
+        self.check_names()?;
         let sync = self.handle.next_sync();
         let packet = Request::new(request::UPSERT, sync, None)
             .str(key::SPACE_NAME, &self.name)
             .uint(key::INDEX_BASE, 1)
             .serialized(key::TUPLE, tuple, true)?
             .raw_array(key::OPS, &ops.into_ops()?)
-            .finish();
+            .finish()?;
         Ok((sync, packet))
     }
 }
@@ -480,12 +500,13 @@ impl<T: DeserializeOwned + Send + 'static> Space<T> {
 
     /// Delete the tuple with primary key `key`, returning it if it existed.
     pub async fn delete(&self, key: impl Key) -> Result<Option<T>> {
+        self.check_names()?;
         let sync = self.handle.next_sync();
         let packet = Request::new(request::DELETE, sync, None)
             .str(key::SPACE_NAME, &self.name)
             .uint(key::INDEX_ID, 0)
             .array(key::KEY, &key)?
-            .finish();
+            .finish()?;
         let rows: Vec<T> = self.handle.request(sync, packet).await?.data()?;
         Ok(rows.into_iter().next())
     }
@@ -494,6 +515,7 @@ impl<T: DeserializeOwned + Send + 'static> Space<T> {
     ///
     /// Returns `Ok(None)` if no tuple matched. See [`Update`] for the operations.
     pub async fn update(&self, key: impl Key, ops: Update) -> Result<Option<T>> {
+        self.check_names()?;
         let sync = self.handle.next_sync();
         let packet = Request::new(request::UPDATE, sync, None)
             .str(key::SPACE_NAME, &self.name)
@@ -501,7 +523,7 @@ impl<T: DeserializeOwned + Send + 'static> Space<T> {
             .uint(key::INDEX_BASE, 1)
             .array(key::KEY, &key)?
             .raw_array(key::TUPLE, &ops.into_ops()?)
-            .finish();
+            .finish()?;
         let rows: Vec<T> = self.handle.request(sync, packet).await?.data()?;
         Ok(rows.into_iter().next())
     }
@@ -661,6 +683,14 @@ impl<T> Select<T> {
     }
 
     fn build(self) -> Result<(Handle, u64, Bytes)> {
+        if !self.handle.supports(Feature::SpaceAndIndexNames) {
+            return Err(Error::Unsupported("spaces addressed by name (server is older than 3.0)"));
+        }
+        if (self.after.is_some() || self.fetch_position)
+            && !self.handle.supports(Feature::Pagination)
+        {
+            return Err(Error::Unsupported("cursor pagination (server is older than 2.11)"));
+        }
         let key = self.key?;
         let sync = self.handle.next_sync();
         let mut req = Request::new(request::SELECT, sync, None);
@@ -684,7 +714,7 @@ impl<T> Select<T> {
         if self.fetch_position {
             req = req.bool(key::FETCH_POSITION, true);
         }
-        Ok((self.handle, sync, req.finish()))
+        Ok((self.handle, sync, req.finish()?))
     }
 }
 
@@ -806,6 +836,11 @@ impl From<Isolation> for TxOptions {
 /// [`begin`](Self::begin) … [`commit`](Self::commit) to make them atomic; if
 /// the [`Stream`] is dropped mid-transaction, a rollback is sent for you.
 ///
+/// A transaction lives and dies with its connection: if the link is lost
+/// and re-established, the server has already rolled the transaction back,
+/// and every further request on it — including `commit` — fails with
+/// [`Error::Closed`] rather than running outside the transaction.
+///
 /// A stream carries no spaces of its own yet; issue DML through
 /// [`call`](Self::call) or the low-level requests on the parent client while
 /// the transaction is open. (Typed DML on a stream is a planned addition.)
@@ -813,6 +848,10 @@ pub struct Stream {
     handle: Handle,
     id: u64,
     in_transaction: bool,
+    /// The connection generation [`begin`](Self::begin) ran on. Requests of
+    /// an open transaction are pinned to it: a transaction dies with its
+    /// connection, and a request must never land on a different link.
+    tx_generation: u64,
 }
 
 impl Stream {
@@ -855,27 +894,58 @@ impl Stream {
         if options.synchronous {
             req = req.bool(key::IS_SYNC, true);
         }
-        self.handle.request(sync, req.finish()).await?;
+        let packet = req.finish()?;
+        // Mark the transaction open before sending: a timed-out or
+        // cancelled `begin` still rolls back on drop. A server-side
+        // rejection means no transaction exists, so restore the flag.
+        let was_in_transaction = self.in_transaction;
+        self.tx_generation = self.handle.generation();
         self.in_transaction = true;
-        Ok(())
+        match self.handle.request(sync, packet).await {
+            Ok(_) => Ok(()),
+            Err(err @ Error::Server(_)) => {
+                self.in_transaction = was_in_transaction;
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Commit the transaction on this stream.
+    ///
+    /// A failed commit aborts the transaction server-side, so the stream
+    /// leaves the transaction on `Ok` and on a server error alike; only a
+    /// transport failure leaves it open.
     pub async fn commit(&mut self) -> Result<()> {
         let sync = self.handle.next_sync();
-        let packet = Request::new(request::COMMIT, sync, Some(self.id)).finish();
-        self.handle.request(sync, packet).await?;
-        self.in_transaction = false;
-        Ok(())
+        let packet = Request::new(request::COMMIT, sync, Some(self.id)).finish()?;
+        let result = self.handle.request_in(sync, packet, self.tx_generation()).await.map(drop);
+        if result.is_ok() || matches!(result, Err(Error::Server(_))) {
+            self.in_transaction = false;
+        }
+        result
     }
 
     /// Roll the transaction on this stream back.
     pub async fn rollback(&mut self) -> Result<()> {
         let sync = self.handle.next_sync();
-        let packet = Request::new(request::ROLLBACK, sync, Some(self.id)).finish();
-        self.handle.request(sync, packet).await?;
-        self.in_transaction = false;
-        Ok(())
+        let packet = Request::new(request::ROLLBACK, sync, Some(self.id)).finish()?;
+        let result = self.handle.request_in(sync, packet, self.tx_generation()).await.map(drop);
+        if result.is_ok() {
+            self.in_transaction = false;
+        }
+        result
+    }
+
+    /// The generation transaction requests are pinned to, if one is open.
+    fn tx_generation(&self) -> Option<u64> {
+        self.in_transaction.then_some(self.tx_generation)
+    }
+
+    /// The stream's scope for SQL plumbing: its id, and the generation of
+    /// the open transaction, if any.
+    fn scope(&self) -> sql::StreamScope {
+        sql::StreamScope { id: self.id, generation: self.tx_generation() }
     }
 
     /// Call a stored function within this stream's ordering (and transaction, if open).
@@ -884,8 +954,8 @@ impl Stream {
         let packet = Request::new(request::CALL, sync, Some(self.id))
             .str(key::FUNCTION_NAME, name)
             .array(key::TUPLE, &args)?
-            .finish();
-        self.handle.request(sync, packet).await?.data()
+            .finish()?;
+        self.handle.request_in(sync, packet, self.tx_generation()).await?.data()
     }
 
     /// Evaluate Lua within this stream's ordering (and transaction, if open).
@@ -898,8 +968,8 @@ impl Stream {
         let packet = Request::new(request::EVAL, sync, Some(self.id))
             .str(key::EXPR, expr)
             .array(key::TUPLE, &args)?
-            .finish();
-        self.handle.request(sync, packet).await?.data()
+            .finish()?;
+        self.handle.request_in(sync, packet, self.tx_generation()).await?.data()
     }
 
     /// [`Client::query`] within this stream's ordering and transaction.
@@ -908,12 +978,12 @@ impl Stream {
         sql: &str,
         params: impl Args,
     ) -> Result<Rows<T>> {
-        sql::rows(&sql::run_text(&self.handle, Some(self.id), sql, params).await?)
+        sql::rows(&sql::run_text(&self.handle, Some(self.scope()), sql, params).await?)
     }
 
     /// [`Client::execute`] within this stream's ordering and transaction.
     pub async fn execute(&self, sql: &str, params: impl Args) -> Result<Exec> {
-        sql::exec(&sql::run_text(&self.handle, Some(self.id), sql, params).await?)
+        sql::exec(&sql::run_text(&self.handle, Some(self.scope()), sql, params).await?)
     }
 
     /// Run a prepared statement for its rows, within this stream.
@@ -922,12 +992,12 @@ impl Stream {
         statement: &Statement,
         params: impl Args,
     ) -> Result<Rows<T>> {
-        sql::rows(&statement.run(Some(self.id), params).await?)
+        sql::rows(&statement.run(Some(self.scope()), params).await?)
     }
 
     /// Run a prepared statement for its effect, within this stream.
     pub async fn execute_prepared(&self, statement: &Statement, params: impl Args) -> Result<Exec> {
-        sql::exec(&statement.run(Some(self.id), params).await?)
+        sql::exec(&statement.run(Some(self.scope()), params).await?)
     }
 }
 
@@ -935,10 +1005,13 @@ impl Drop for Stream {
     fn drop(&mut self) {
         if self.in_transaction {
             // Best-effort: fire a rollback so an abandoned transaction does
-            // not hold locks until its timeout. Nothing to await in Drop.
-            let packet =
-                Request::new(request::ROLLBACK, self.handle.next_sync(), Some(self.id)).finish();
-            self.handle.fire(packet);
+            // not hold locks until its timeout. Nothing to await in Drop,
+            // and no send at all if the transaction's link is already gone.
+            if let Ok(packet) =
+                Request::new(request::ROLLBACK, self.handle.next_sync(), Some(self.id)).finish()
+            {
+                self.handle.fire(packet, Some(self.tx_generation));
+            }
         }
     }
 }

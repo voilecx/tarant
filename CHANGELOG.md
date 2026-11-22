@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-22
+
 ### Fixed
 
 - `Uuid::from_str` no longer panics or misparses on misplaced hyphens: they
@@ -18,12 +20,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carried; messages name the host and which credential failed.
 - `ConnectOptions::new` normalises IPv6 literals: `"::1"` and `"[::1]"`
   become `"[::1]:3301"`, while `"[::1]:3302"` is kept.
+- Error text and event keys in replies are decoded lossily (U+FFFD for
+  invalid UTF-8) instead of failing the whole packet; a malformed
+  `IPROTO_ERROR` map falls back to the plain error message.
+- A response claiming a huge length no longer reserves that much memory up
+  front, and lengths over `max_packet_size` are rejected outright.
+- Push chunks for streamed calls are zero-copy slices of the reply;
+  a consumer falling more than 1024 chunks behind fails its request
+  instead of growing memory without bound.
 
 ### Added
 
 - `Sub` for `Interval` (unit-wise and saturating, like `Add`).
 - `Decimal::MAX_EXPONENT`, the server's bound on the adjusted exponent.
 - `usize` and `isize` as single-field keys.
+- `ConnectOptions::keepalive(interval)`: sends `IPROTO_PING` after an
+  interval of silence and drops the link after a second one.
+- `ConnectOptions::max_packet_size(bytes)`: caps the largest accepted
+  response frame; the default stays the 2 GiB protocol maximum.
+- `tests/fake_server.rs`, a scripted iproto server that exercises
+  reconnects, graceful shutdown, batching and malformed replies without a
+  real Tarantool.
 
 ### Changed
 
@@ -37,6 +54,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   still equal to `"0"`.
 - `Key`'s documentation warns that `Vec<u8>`/`&[u8]` encodes as an array
   of integers, not a `varbinary` field.
+- Breaking: request packets are built in a single buffer; `codec::Request`
+  is crate-internal, so this only shows as `ArrayLike` now serialising
+  without a temporary.
+- The connection task reads and writes independently: commands are
+  buffered and flushed in batches, so a stalled writer no longer blocks
+  replies, and one encode failure costs only that request.
+- Reconnect backoff now uses `saturating_mul`, a 1 ms floor and equal
+  jitter; commands arriving during the whole wait are still accepted.
+- `server_info()` is documented as the first-handshake snapshot; live
+  feature checks go through the re-negotiated set.
+- Requests for spaces or indexes by name fail fast with
+  `Error::Unsupported` on pre-3.0 servers; selects using `after`/`page`
+  require pagination support (2.11+).
+- A request whose caller has already timed out or been cancelled is never
+  sent — including ones queued during a reconnect.
+- Watcher registration caches the latest value per key: a second
+  `Client::watch` resolves immediately, and a subscribe nobody awaits is
+  unwatched instead of leaking.
+- Breaking: transaction requests — `begin`, `commit`, `rollback`, the
+  drop-time rollback and everything issued on an open transaction — are
+  pinned to their connection generation. After a reconnect they fail with
+  `Error::Closed` instead of running outside the dead transaction.
+- `Client::close` drains in-flight requests (up to the request timeout,
+  else 5 s) before shutting the task down; `Handle::fire` no longer loses
+  Drop-path sends to a full channel when a runtime is around.
+- On `box.shutdown` the client stops taking work, lets pending replies
+  land, closes the socket and — with `Reconnect::Backoff` — reconnects;
+  `Reconnect::Never` still ends the task with `Error::ShuttingDown`.
+
 
 ## [0.3.0] — 2026-11-13
 
@@ -131,7 +177,8 @@ First release.
 - Automatic reconnection with backoff: the handshake is replayed and every
   watcher re-subscribed.
 
-[Unreleased]: https://github.com/voilecx/tarant/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/voilecx/tarant/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/voilecx/tarant/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/voilecx/tarant/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/voilecx/tarant/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/voilecx/tarant/compare/v0.1.1...v0.2.0

@@ -13,23 +13,36 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rmpv::Value;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio_util::codec::{Decoder, Encoder};
+use tracing::debug;
 
 use crate::error::{Error, ErrorCode, Result, ServerError};
 use crate::iproto::{error as error_key, key, response};
-use crate::msgpack::{MapCursor, read_str, read_uint};
+use crate::msgpack::{MapCursor, read_str, read_str_lossy, read_uint};
 use crate::tuple::ArrayLike;
 
 /// Largest packet we are willing to buffer, matching the server's own limit.
-const MAX_PACKET_LEN: usize = 2 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_PACKET: usize = 2 * 1024 * 1024 * 1024;
+
+/// How far the buffer may grow for bytes that have not arrived yet.
+const RESERVE_CHUNK: usize = 64 * 1024;
 
 /// Length-prefixed packet framing.
-#[derive(Debug, Default)]
-pub(crate) struct Codec;
+#[derive(Debug)]
+pub(crate) struct Codec {
+    /// Largest response frame accepted, from `ConnectOptions::max_packet_size`.
+    max_packet: usize,
+}
+
+impl Codec {
+    pub(crate) const fn new(max_packet: usize) -> Self {
+        Self { max_packet }
+    }
+}
 
 impl Decoder for Codec {
     type Item = Response;
@@ -48,7 +61,9 @@ impl Decoder for Codec {
             other => return Err(Error::protocol(format!("bad packet length marker {other:#04x}"))),
         };
         if src.len() < prefix {
-            src.reserve(prefix - src.len());
+            // Reserve only a little: the buffer grows as bytes really arrive,
+            // so a hostile length can never conjure gigabytes of memory.
+            src.reserve((prefix - src.len()).min(RESERVE_CHUNK));
             return Ok(None);
         }
         let len = match prefix {
@@ -63,11 +78,14 @@ impl Decoder for Codec {
                     .map_err(|_| Error::protocol("packet length does not fit in memory"))?
             }
         };
-        if len > MAX_PACKET_LEN {
-            return Err(Error::protocol(format!("packet of {len} bytes exceeds the 2 GiB limit")));
+        if len > self.max_packet {
+            return Err(Error::protocol(format!(
+                "packet of {len} bytes exceeds the configured {}-byte limit",
+                self.max_packet
+            )));
         }
         if src.len() < prefix + len {
-            src.reserve(prefix + len - src.len());
+            src.reserve((prefix + len - src.len()).min(RESERVE_CHUNK));
             return Ok(None);
         }
         src.advance(prefix);
@@ -80,66 +98,68 @@ impl Encoder<Bytes> for Codec {
     type Error = Error;
 
     fn encode(&mut self, packet: Bytes, dst: &mut BytesMut) -> Result<()> {
-        let len = u32::try_from(packet.len())
-            .map_err(|_| Error::protocol("request exceeds the 4 GiB packet limit"))?;
-        dst.reserve(5 + packet.len());
-        dst.put_u8(0xce);
-        dst.put_u32(len);
+        // `Request::finish` already produced the whole frame, length prefix
+        // included; sending is a plain append into the write buffer.
         dst.extend_from_slice(&packet);
         Ok(())
     }
 }
 
-/// A request under construction: the header is fixed at creation, body
-/// entries are appended one `(key, value)` at a time, and `finish` joins the
-/// two with the entry count the body map needs.
+/// A request under construction, written into a single buffer: the 5-byte
+/// `0xce` length prefix, the header map, then the body map's entries. The
+/// body-map marker is a one-byte placeholder that `finish` patches with the
+/// entry count, so a request never has more than 15 body entries.
 #[derive(Debug)]
 pub(crate) struct Request {
-    header: Vec<u8>,
-    body: Vec<u8>,
+    buf: Vec<u8>,
+    /// Offset of the body-map marker byte inside `buf`.
+    body_marker: usize,
     entries: u32,
 }
 
 impl Request {
     /// Begin a request of type `ty`, optionally inside a stream.
     pub(crate) fn new(ty: u64, sync: u64, stream_id: Option<u64>) -> Self {
-        let mut header = Vec::with_capacity(24);
+        let mut buf = Vec::with_capacity(96);
+        buf.extend_from_slice(&[0xce, 0, 0, 0, 0]);
         let header_len = 2 + u32::from(stream_id.is_some());
-        rmp::encode::write_map_len(&mut header, header_len).expect("vec write");
-        put_uint(&mut header, key::REQUEST_TYPE, ty);
-        put_uint(&mut header, key::SYNC, sync);
+        rmp::encode::write_map_len(&mut buf, header_len).expect("vec write");
+        put_uint(&mut buf, key::REQUEST_TYPE, ty);
+        put_uint(&mut buf, key::SYNC, sync);
         if let Some(stream_id) = stream_id {
-            put_uint(&mut header, key::STREAM_ID, stream_id);
+            put_uint(&mut buf, key::STREAM_ID, stream_id);
         }
-        Self { header, body: Vec::with_capacity(64), entries: 0 }
+        let body_marker = buf.len();
+        buf.push(0x80);
+        Self { buf, body_marker, entries: 0 }
     }
 
     fn key(&mut self, k: u8) {
         self.entries += 1;
-        rmp::encode::write_uint(&mut self.body, u64::from(k)).expect("vec write");
+        rmp::encode::write_uint(&mut self.buf, u64::from(k)).expect("vec write");
     }
 
     pub(crate) fn uint(mut self, k: u8, v: u64) -> Self {
         self.key(k);
-        rmp::encode::write_uint(&mut self.body, v).expect("vec write");
+        rmp::encode::write_uint(&mut self.buf, v).expect("vec write");
         self
     }
 
     pub(crate) fn str(mut self, k: u8, v: &str) -> Self {
         self.key(k);
-        rmp::encode::write_str(&mut self.body, v).expect("vec write");
+        rmp::encode::write_str(&mut self.buf, v).expect("vec write");
         self
     }
 
     pub(crate) fn bool(mut self, k: u8, v: bool) -> Self {
         self.key(k);
-        rmp::encode::write_bool(&mut self.body, v).expect("vec write");
+        rmp::encode::write_bool(&mut self.buf, v).expect("vec write");
         self
     }
 
     pub(crate) fn f64(mut self, k: u8, v: f64) -> Self {
         self.key(k);
-        rmp::encode::write_f64(&mut self.body, v).expect("vec write");
+        rmp::encode::write_f64(&mut self.buf, v).expect("vec write");
         self
     }
 
@@ -153,9 +173,9 @@ impl Request {
         expect_array: bool,
     ) -> Result<Self> {
         self.key(k);
-        let start = self.body.len();
-        rmp_serde::encode::write(&mut self.body, value).map_err(Error::encode)?;
-        if expect_array && !is_array_marker(self.body.get(start).copied()) {
+        let start = self.buf.len();
+        rmp_serde::encode::write(&mut self.buf, value).map_err(Error::encode)?;
+        if expect_array && !is_array_marker(self.buf.get(start).copied()) {
             return Err(Error::encode(NotAnArray));
         }
         Ok(self)
@@ -166,8 +186,8 @@ impl Request {
         self.key(k);
         let len = u32::try_from(payload.len())
             .map_err(|_| Error::protocol("extension payload exceeds 4 GiB"))?;
-        rmp::encode::write_ext_meta(&mut self.body, len, tag).expect("vec write");
-        self.body.extend_from_slice(payload);
+        rmp::encode::write_ext_meta(&mut self.buf, len, tag).expect("vec write");
+        self.buf.extend_from_slice(payload);
         Ok(self)
     }
 
@@ -175,14 +195,14 @@ impl Request {
     /// with no intermediate buffer.
     pub(crate) fn array<T: ArrayLike + ?Sized>(mut self, k: u8, value: &T) -> Result<Self> {
         self.key(k);
-        value.encode(&mut self.body)?;
+        value.encode(&mut self.buf)?;
         Ok(self)
     }
 
     /// Write an already-encoded `MessagePack` value verbatim.
     pub(crate) fn raw(mut self, k: u8, msgpack: &[u8]) -> Self {
         self.key(k);
-        self.body.extend_from_slice(msgpack);
+        self.buf.extend_from_slice(msgpack);
         self
     }
 
@@ -190,18 +210,21 @@ impl Request {
     pub(crate) fn raw_array(mut self, k: u8, elements: &[Vec<u8>]) -> Self {
         self.key(k);
         let len = u32::try_from(elements.len()).expect("an array of < 4 billion elements");
-        rmp::encode::write_array_len(&mut self.body, len).expect("vec write");
+        rmp::encode::write_array_len(&mut self.buf, len).expect("vec write");
         for element in elements {
-            self.body.extend_from_slice(element);
+            self.buf.extend_from_slice(element);
         }
         self
     }
 
-    pub(crate) fn finish(mut self) -> Bytes {
-        let mut packet = self.header;
-        rmp::encode::write_map_len(&mut packet, self.entries).expect("vec write");
-        packet.append(&mut self.body);
-        Bytes::from(packet)
+    /// Seal the packet: patch the body-map marker and the length prefix.
+    pub(crate) fn finish(mut self) -> Result<Bytes> {
+        debug_assert!(self.entries <= 15);
+        self.buf[self.body_marker] = 0x80 | u8::try_from(self.entries).unwrap_or(0x0f);
+        let len = u32::try_from(self.buf.len() - 5)
+            .map_err(|_| Error::protocol("request exceeds the 4 GiB packet limit"))?;
+        self.buf[1..5].copy_from_slice(&len.to_be_bytes());
+        Ok(Bytes::from(self.buf))
     }
 }
 
@@ -264,7 +287,7 @@ pub(crate) struct Response {
 
 impl Response {
     fn parse(packet: &Bytes) -> Result<Self> {
-        let (mut header, header_len) = MapCursor::new(packet)?;
+        let mut header = MapCursor::new(packet)?;
         let mut request_type = None;
         let mut sync = 0;
         let mut schema_version = None;
@@ -278,6 +301,7 @@ impl Response {
         }
         let request_type =
             request_type.ok_or_else(|| Error::protocol("response header has no request type"))?;
+        let header_len = header.end();
 
         let kind = match request_type {
             response::OK => Kind::Ok,
@@ -307,7 +331,7 @@ impl Response {
         if this.body.is_empty() {
             return Ok(this);
         }
-        let (mut body, _) = MapCursor::new(&this.body)?;
+        let mut body = MapCursor::new(&this.body)?;
         let mut error_24 = None;
         let mut error_ext = None;
         while let Some((k, start, v)) = body.next()? {
@@ -315,9 +339,9 @@ impl Response {
             match u8::try_from(k).unwrap_or(u8::MAX) {
                 key::DATA => this.data = Some(range),
                 key::POSITION => this.position = Some(read_str(v)?.to_owned()),
-                key::ERROR_24 => error_24 = Some(read_str(v)?.to_owned()),
+                key::ERROR_24 => error_24 = Some(read_str_lossy(v)?.into_owned()),
                 key::ERROR => error_ext = Some(v.to_vec()),
-                key::EVENT_KEY => this.event_key = Some(read_str(v)?.to_owned()),
+                key::EVENT_KEY => this.event_key = Some(read_str_lossy(v)?.into_owned()),
                 key::EVENT_DATA => this.event_data = Some(range),
                 key::METADATA => this.metadata = Some(range),
                 key::BIND_METADATA => this.bind_metadata = Some(range),
@@ -331,7 +355,15 @@ impl Response {
         if kind == Kind::Error {
             let code = u32::try_from(request_type & !response::ERROR_FLAG).unwrap_or(0);
             this.error = Some(Box::new(match error_ext {
-                Some(bytes) => decode_error_map(&bytes, code)?,
+                // A malformed IPROTO_ERROR must not take the packet down
+                // with it; the 0x31 string carries the same message.
+                Some(bytes) => match decode_error_map(&bytes, code) {
+                    Ok(err) => err,
+                    Err(err) => {
+                        debug!(error = %err, "malformed MP_ERROR; using IPROTO_ERROR_24");
+                        ServerError::from_message(code, error_24.unwrap_or_default())
+                    }
+                },
                 None => ServerError::from_message(code, error_24.unwrap_or_default()),
             }));
         }
@@ -351,7 +383,7 @@ impl Response {
         if self.body.is_empty() {
             return Ok(map);
         }
-        let (mut cursor, _) = MapCursor::new(&self.body)?;
+        let mut cursor = MapCursor::new(&self.body)?;
         while let Some((k, _, v)) = cursor.next()? {
             let value = rmpv::decode::read_value(&mut &v[..])
                 .map_err(|e| Error::protocol(format!("malformed body value: {e}")))?;
@@ -363,6 +395,13 @@ impl Response {
     /// The `IPROTO_DATA` payload as raw `MessagePack` (`nil` if absent).
     pub(crate) fn data_bytes(&self) -> &[u8] {
         self.slice(self.data).unwrap_or(&[0xc0])
+    }
+
+    /// The `IPROTO_DATA` payload as a zero-copy slice of the packet, for a
+    /// `box.session.push()` chunk that is consumed right away.
+    pub(crate) fn chunk_bytes(&self) -> Option<Bytes> {
+        let (start, end) = self.data?;
+        Some(self.body.slice(start..end))
     }
 
     /// Whether the body carries `IPROTO_DATA` at all.
@@ -449,10 +488,10 @@ fn decode_error_frame(frame: &Value) -> Result<ServerError> {
     let mut err = ServerError::from_message(0, "");
     for (k, v) in entries {
         match k.as_u64().and_then(|k| u8::try_from(k).ok()) {
-            Some(error_key::TYPE) => v.as_str().unwrap_or_default().clone_into(&mut err.kind),
+            Some(error_key::TYPE) => err.kind = lossy_str(v),
             Some(error_key::FILE) => err.file = v.as_str().map(str::to_owned),
             Some(error_key::LINE) => err.line = v.as_u64(),
-            Some(error_key::MESSAGE) => v.as_str().unwrap_or_default().clone_into(&mut err.message),
+            Some(error_key::MESSAGE) => err.message = lossy_str(v),
             Some(error_key::ERRNO) => err.errno = v.as_u64().unwrap_or(0),
             Some(error_key::ERRCODE) => {
                 err.code = ErrorCode(v.as_u64().and_then(|c| u32::try_from(c).ok()).unwrap_or(0));
@@ -474,6 +513,18 @@ fn decode_error_frame(frame: &Value) -> Result<ServerError> {
     Ok(err)
 }
 
+/// A text field from an error frame: valid UTF-8 verbatim, anything else
+/// lossily from the raw bytes rather than dropped.
+fn lossy_str(value: &Value) -> String {
+    match value {
+        Value::String(text) => match text.as_str() {
+            Some(text) => text.to_owned(),
+            None => String::from_utf8_lossy(text.as_bytes()).into_owned(),
+        },
+        _ => String::new(),
+    }
+}
+
 /// Serialise `value` to a standalone `MessagePack` buffer.
 pub(crate) fn to_msgpack<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -492,11 +543,16 @@ mod tests {
     use super::*;
     use crate::iproto::request;
 
+    /// A whole frame: the `0xce` length prefix, then header and body maps.
     fn packet(header: &Value, body: &Value) -> Bytes {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, header).unwrap();
         rmpv::encode::write_value(&mut buf, body).unwrap();
-        Bytes::from(buf)
+        let mut frame = Vec::with_capacity(buf.len() + 5);
+        frame.push(0xce);
+        frame.extend_from_slice(&u32::try_from(buf.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&buf);
+        Bytes::from(frame)
     }
 
     fn map(entries: Vec<(u8, Value)>) -> Value {
@@ -514,8 +570,9 @@ mod tests {
             .uint(key::LIMIT, u64::from(u32::MAX))
             .serialized(key::KEY, &(280u32,), true)
             .unwrap()
-            .finish();
-        let mut cursor = &bytes[..];
+            .finish()
+            .unwrap();
+        let mut cursor = &bytes[5..];
         let header = rmpv::decode::read_value(&mut cursor).unwrap();
         let body = rmpv::decode::read_value(&mut cursor).unwrap();
         assert_eq!(header, map(vec![(0, Value::from(1)), (1, Value::from(4))]));
@@ -544,8 +601,8 @@ mod tests {
 
     #[test]
     fn stream_id_lands_in_the_header() {
-        let bytes = Request::new(request::PING, 9, Some(3)).finish();
-        let mut cursor = &bytes[..];
+        let bytes = Request::new(request::PING, 9, Some(3)).finish().unwrap();
+        let mut cursor = &bytes[5..];
         let header = rmpv::decode::read_value(&mut cursor).unwrap();
         assert_eq!(
             header,
@@ -563,8 +620,9 @@ mod tests {
             )]),
         );
         let mut framed = BytesMut::new();
-        Codec.encode(packet, &mut framed).unwrap();
-        let response = Codec.decode(&mut framed).unwrap().expect("a whole packet");
+        Codec::new(DEFAULT_MAX_PACKET).encode(packet, &mut framed).unwrap();
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        let response = codec.decode(&mut framed).unwrap().expect("a whole packet");
         assert_eq!(response.kind, Kind::Ok);
         assert_eq!(response.sync, 7);
         assert_eq!(response.schema_version, Some(100));
@@ -578,11 +636,12 @@ mod tests {
         let packet =
             packet(&map(vec![(0x00, Value::from(0)), (0x01, Value::from(1))]), &map(vec![]));
         let mut framed = BytesMut::new();
-        Codec.encode(packet, &mut framed).unwrap();
+        Codec::new(DEFAULT_MAX_PACKET).encode(packet, &mut framed).unwrap();
         let cut = framed.split_off(4);
-        assert!(Codec.decode(&mut framed).unwrap().is_none());
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        assert!(codec.decode(&mut framed).unwrap().is_none());
         framed.unsplit(cut);
-        assert!(Codec.decode(&mut framed).unwrap().is_some());
+        assert!(codec.decode(&mut framed).unwrap().is_some());
     }
 
     #[test]
@@ -603,8 +662,9 @@ mod tests {
             ]),
         );
         let mut framed = BytesMut::new();
-        Codec.encode(packet, &mut framed).unwrap();
-        let response = Codec.decode(&mut framed).unwrap().unwrap();
+        Codec::new(DEFAULT_MAX_PACKET).encode(packet, &mut framed).unwrap();
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        let response = codec.decode(&mut framed).unwrap().unwrap();
         assert_eq!(response.kind, Kind::Error);
         let err = response.into_error();
         assert_eq!(err.code, ErrorCode::SPACE_EXISTS);
@@ -620,11 +680,78 @@ mod tests {
             &map(vec![(0x57, Value::from("box.shutdown")), (0x58, Value::from(true))]),
         );
         let mut framed = BytesMut::new();
-        Codec.encode(packet, &mut framed).unwrap();
-        let response = Codec.decode(&mut framed).unwrap().unwrap();
+        Codec::new(DEFAULT_MAX_PACKET).encode(packet, &mut framed).unwrap();
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        let response = codec.decode(&mut framed).unwrap().unwrap();
         assert_eq!(response.kind, Kind::Event);
         let (k, data) = response.event().unwrap();
         assert_eq!(k, "box.shutdown");
         assert_eq!(data, &[0xc3]);
+    }
+
+    #[test]
+    fn request_carries_its_own_length_prefix() {
+        let bytes = Request::new(request::PING, 1, None).finish().unwrap();
+        assert_eq!(bytes[0], 0xce);
+        let len = u32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        assert_eq!(len as usize, bytes.len() - 5);
+    }
+
+    #[test]
+    fn non_utf8_error_text_decodes_lossily() {
+        // { 0x31: <str of ff fe> }: the text is not UTF-8 but the error is.
+        let body = [0x81, 0x31, 0xa2, 0xff, 0xfe];
+        let packet =
+            packet_bytes(&map(vec![(0x00, Value::from(0x8020)), (0x01, Value::from(5))]), &body);
+        let mut framed = BytesMut::from(&packet[..]);
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        let response = codec.decode(&mut framed).unwrap().unwrap();
+        assert_eq!(response.kind, Kind::Error);
+        let err = response.into_error();
+        assert_eq!(err.code, ErrorCode(0x20));
+        assert!(err.message.contains('\u{fffd}'), "{}", err.message);
+    }
+
+    #[test]
+    fn malformed_error_extension_falls_back_to_error_24() {
+        // 0x52 must be a map with a stack; an integer is not, but 0x31 is fine.
+        let body = [0x82, 0x31, 0xa4, b'g', b'o', b'n', b'e', 0x52, 0x07];
+        let packet =
+            packet_bytes(&map(vec![(0x00, Value::from(0x8020)), (0x01, Value::from(5))]), &body);
+        let mut framed = BytesMut::from(&packet[..]);
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        let response = codec.decode(&mut framed).unwrap().unwrap();
+        let err = response.into_error();
+        assert_eq!(err.code, ErrorCode(0x20));
+        assert_eq!(err.message, "gone");
+    }
+
+    #[test]
+    fn a_claimed_length_does_not_preallocate() {
+        // A frame header claiming 1 GiB, and nothing more.
+        let mut framed = BytesMut::from(&[0xce, 0x40, 0x00, 0x00, 0x00][..]);
+        let mut codec = Codec::new(DEFAULT_MAX_PACKET);
+        assert!(codec.decode(&mut framed).unwrap().is_none());
+        assert!(framed.capacity() <= 128 * 1024, "capacity grew to {}", framed.capacity());
+    }
+
+    #[test]
+    fn a_length_above_the_configured_limit_is_an_error() {
+        let mut framed = BytesMut::from(&[0xce, 0x00, 0x00, 0x08, 0x00][..]);
+        let mut codec = Codec::new(1024);
+        let err = codec.decode(&mut framed).unwrap_err();
+        assert!(err.to_string().contains("1024"), "{err}");
+    }
+
+    /// A frame whose body is raw bytes rather than a `Value`.
+    fn packet_bytes(header: &Value, body: &[u8]) -> Bytes {
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, header).unwrap();
+        buf.extend_from_slice(body);
+        let mut frame = Vec::with_capacity(buf.len() + 5);
+        frame.push(0xce);
+        frame.extend_from_slice(&u32::try_from(buf.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(&buf);
+        Bytes::from(frame)
     }
 }

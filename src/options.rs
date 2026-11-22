@@ -34,6 +34,8 @@ pub struct ConnectOptions {
     request_timeout: Option<Duration>,
     reconnect: Reconnect,
     tcp_nodelay: bool,
+    max_packet: usize,
+    keepalive: Option<Duration>,
 }
 
 impl ConnectOptions {
@@ -62,6 +64,8 @@ impl ConnectOptions {
             request_timeout: None,
             reconnect: Reconnect::default(),
             tcp_nodelay: true,
+            max_packet: crate::codec::DEFAULT_MAX_PACKET,
+            keepalive: None,
         }
     }
 
@@ -124,6 +128,30 @@ impl ConnectOptions {
         self
     }
 
+    /// The largest response frame accepted, in bytes.
+    ///
+    /// Defaults to 2 GiB, the protocol's own maximum; lower it when the
+    /// server is not fully trusted so a hostile length prefix cannot make
+    /// the client buffer more than it should.
+    #[must_use]
+    pub const fn max_packet_size(mut self, bytes: usize) -> Self {
+        self.max_packet = bytes;
+        self
+    }
+
+    /// Send a keepalive `IPROTO_PING` after `interval` without a reply, and
+    /// treat the link as dead if another `interval` passes with still
+    /// nothing received. Off by default.
+    ///
+    /// Any packet from the server resets the timer. Beware false positives:
+    /// a server whose TX thread is blocked longer than the interval will
+    /// look dead, and the client will drop a working connection.
+    #[must_use]
+    pub const fn keepalive(mut self, interval: Duration) -> Self {
+        self.keepalive = Some(interval);
+        self
+    }
+
     /// What to do when the connection drops. Default: retry with backoff.
     #[must_use]
     pub const fn reconnect(mut self, policy: Reconnect) -> Self {
@@ -167,6 +195,14 @@ impl ConnectOptions {
     pub(crate) const fn nodelay(&self) -> bool {
         self.tcp_nodelay
     }
+
+    pub(crate) const fn max_packet(&self) -> usize {
+        self.max_packet
+    }
+
+    pub(crate) const fn keepalive_interval(&self) -> Option<Duration> {
+        self.keepalive
+    }
 }
 
 impl FromStr for ConnectOptions {
@@ -188,6 +224,8 @@ impl fmt::Debug for ConnectOptions {
             .field("request_timeout", &self.request_timeout)
             .field("reconnect", &self.reconnect)
             .field("tcp_nodelay", &self.tcp_nodelay)
+            .field("max_packet", &self.max_packet)
+            .field("keepalive", &self.keepalive)
             .finish()
     }
 }

@@ -10,7 +10,6 @@
 use rmpv::Value;
 use serde::Serialize;
 
-use crate::codec::to_msgpack;
 use crate::error::Result;
 use crate::types::{Datetime, Decimal, Interval, Uuid};
 
@@ -70,8 +69,7 @@ macro_rules! scalar_keys {
         impl ArrayLike for $ty {
             fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
                 buf.push(0x91);
-                buf.extend_from_slice(&to_msgpack(self)?);
-                Ok(())
+                rmp_serde::encode::write(buf, self).map_err(crate::error::Error::encode)
             }
         }
     )*};
@@ -117,15 +115,13 @@ impl<T: Serialize> ArrayLike for Vec<T> {
 
 impl<T: Serialize> ArrayLike for [T] {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
-        buf.extend_from_slice(&to_msgpack(self)?);
-        Ok(())
+        rmp_serde::encode::write(buf, self).map_err(crate::error::Error::encode)
     }
 }
 
 impl<T: Serialize, const N: usize> ArrayLike for [T; N] {
     fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
-        buf.extend_from_slice(&to_msgpack(self.as_slice())?);
-        Ok(())
+        rmp_serde::encode::write(buf, self.as_slice()).map_err(crate::error::Error::encode)
     }
 }
 
@@ -133,8 +129,7 @@ macro_rules! tuple_keys {
     ($($name:ident),+) => {
         impl<$($name: Serialize),+> ArrayLike for ($($name,)+) {
             fn encode(&self, buf: &mut Vec<u8>) -> Result<()> {
-                buf.extend_from_slice(&to_msgpack(self)?);
-                Ok(())
+                rmp_serde::encode::write(buf, self).map_err(crate::error::Error::encode)
             }
         }
     };

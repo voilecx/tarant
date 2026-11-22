@@ -9,6 +9,7 @@
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
+use tokio::time::timeout;
 
 use crate::connection::Handle;
 
@@ -45,9 +46,16 @@ impl Watcher {
     pub(crate) async fn subscribe(handle: Handle, key: String) -> Result<Self> {
         let (id, mut receiver) = handle.watch(key.clone()).await?;
         // The first notification arrives right after registration; wait for
-        // it so `get` has a value to return without blocking.
+        // it so `get` has a value to return without blocking — but no longer
+        // than the configured request timeout.
         if receiver.borrow().is_none() {
-            receiver.changed().await.map_err(|_| Error::Closed)?;
+            match handle.request_timeout() {
+                Some(limit) => {
+                    timeout(limit, receiver.changed()).await.map_err(|_| Error::Timeout(limit))?
+                }
+                None => receiver.changed().await,
+            }
+            .map_err(|_| Error::Closed)?;
         }
         Ok(Self { handle, id, key, receiver })
     }
